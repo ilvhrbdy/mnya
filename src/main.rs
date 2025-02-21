@@ -88,7 +88,11 @@ impl Display for Error<'_> {
 
             for (n, line) in couple_of_lines {
                 let line_num = n + 1;
-                writeln!(f, "{line_num:<4}|   {line:<4}")?;
+                writeln!(
+                    f,
+                    "{line_num:<3}{ptr}|   {line:<4}",
+                    ptr = if line_num == err_line { ">" } else { " " }
+                )?;
             }
 
             writeln!(
@@ -124,8 +128,10 @@ impl Display for Error<'_> {
 
                 writeln!(
                     f,
-                    "---> previous declaration at {}:{} here:",
-                    second.line, second.position
+                    "{ptr:->5} previous declaration at {}:{} here:",
+                    second.line,
+                    second.position,
+                    ptr = ">",
                 )?;
                 point_on_err(f, second.line, second.position, self.source)?;
 
@@ -135,7 +141,10 @@ impl Display for Error<'_> {
                 writeln!(f, "unallawed label character `{ch}`, bruh:")?
             }
             ErrorKind::EvaluatingScript(err) => {
-                writeln!(f, "script error: {err}")?; // TODO: proper formatting
+                writeln!(f, "script error:")?; // TODO: proper formatting
+                for l in err.lines() {
+                    writeln!(f, "{ptr:->5} {l}", ptr = ">")?;
+                }
             }
             ErrorKind::UnclosedDelimiter {
                 delimiter,
@@ -153,7 +162,8 @@ impl Display for Error<'_> {
 
                 writeln!(
                     f,
-                    "---> and suppose to end at {err_line}:{err_position} here:"
+                    "{ptr:->5} and suppose to end at {err_line}:{err_position} here:",
+                    ptr = ">"
                 )?;
                 point_on_err(f, err_line, err_position, self.source)?;
 
@@ -179,59 +189,73 @@ enum Output {
     File(PathBuf),
 }
 
-fn parse_args(mut args: impl Iterator<Item = String>) -> Result<(Input, Output), String> {
+fn parse_args(
+    mut args: impl Iterator<Item = String>,
+) -> Result<(Input, Output), Box<dyn std::error::Error>> {
+    let expanded = |mut input: String| {
+        if input.starts_with("~") {
+            let Ok(home) = std::env::var("HOME") else {
+                return input;
+            };
+
+            input.replace_range(..1, &home);
+        }
+
+        input
+    };
+
     let mut mb_input = None::<Input>;
     let mut mb_output = None::<Output>;
-    let working_dir = std::env::var(ENV_INPUT_DIRECTORY).ok();
-    let get_working_dir_path = || working_dir.as_ref().map(PathBuf::from);
+    let mut output_name = String::new();
+    let env_dir = std::env::var(ENV_INPUT_DIRECTORY).ok().map(expanded);
 
     loop {
-        let Some(mut arg) = args.next() else {
+        let Some(arg) = args.next() else {
             break;
         };
 
         match arg.as_str() {
             "-h" => return Err(USAGE.into()),
+            "-print" => mb_output = Some(Output::Stdout),
             "-i" => match args.next() {
                 Some(file_name) => mb_input = Some(Input::File(PathBuf::from(file_name))),
-                None => return Err("[Err] input file for `-i` flag where?".into()),
+                None => return Err("input file for `-i` flag where?".into()),
             },
-            "-print" => mb_output = Some(Output::Stdout),
             a if a.starts_with("-") => {
-                return Err("[Err] i don't know what this flag means..".into());
+                return Err("i don't know what this flag means..".into());
             }
             _ if !matches!(mb_output, Some(Output::Stdout)) => {
-                arg.push('_');
-                for a in args {
-                    arg.push_str(&a);
-                    arg.push('_');
-                }
-                let _ = arg.pop(); // remove trailing '_'
-
-                let mut path = get_working_dir_path()
-                    .map_or_else(|| std::env::current_dir().map_err(to_string), Ok)?;
-
-                path.push(arg);
-                mb_output = Some(Output::File(path));
-
-                break;
+                output_name.push_str(&arg);
+                output_name.push('_');
             }
             _ => (),
         }
     }
 
-    let input = mb_input
-        .or_else(|| get_working_dir_path().map(Input::Dir))
-        .ok_or_else(||
-            format!("[Err] either provide an input note file with `-i` flag or set `{ENV_INPUT_DIRECTORY}`, where notes are stored")
-        )?;
+    if !matches!(mb_output, Some(Output::Stdout)) {
+        let _ = output_name.pop(); // remove trailing '_'
+        let mut path = if let Some(dir) = &env_dir {
+            PathBuf::from(dir)
+        } else {
+            std::env::current_dir()?
+        };
 
-    let output = mb_output.ok_or("[Err] throw some words for new note file name!")?;
+        path.push(output_name);
+        mb_output = Some(Output::File(path));
+    }
+
+    let output = mb_output.ok_or("throw some words for new note file name!")?;
+    let input = mb_input
+        .or_else(|| env_dir.map(PathBuf::from).map(Input::Dir))
+        .ok_or_else(|| {
+            format!("either provide an input `.nya` file with `-i` flag or set `{ENV_INPUT_DIRECTORY}`")
+        })?;
+
 
     Ok((input, output))
 }
 
-#[derive(Debug, Copy, Clone, Default, Eq, PartialEq)]
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
 pub enum ChunkKind {
     // @# ...
     Index,
@@ -240,9 +264,7 @@ pub enum ChunkKind {
     // @@ ... @@
     // closed_by_self = @@ ... @@
     // !closed_by_self = @@ .. :: or EOF
-    CmdBlock {
-        closed_by_self: bool,
-    },
+    CmdBlock { closed_by_self: bool },
     // :: ... ::
     TextBlock,
     // to preserve whitespaces between commands
@@ -259,7 +281,6 @@ pub enum ChunkKind {
     // some text < discarded
     //           < discarded
     // @b: 2
-    #[default]
     Whitespaces,
     DiscardedText,
 }
@@ -285,6 +306,7 @@ impl ChunkKind {
 pub struct Chunk {
     pub kind: ChunkKind,
     pub text: String,
+    // start of the chunk, excluding delimiter
     pub line: usize,
     pub position: usize,
 }
@@ -294,7 +316,7 @@ impl Default for Chunk {
         Self {
             line: 1,
             position: 1,
-            kind: ChunkKind::default(),
+            kind: ChunkKind::Whitespaces,
             text: String::default(),
         }
     }
@@ -307,53 +329,6 @@ impl Display for Chunk {
 
         write!(f, "{open_del}{text}{close_del}")
     }
-}
-
-#[derive(Debug, Clone, Default)]
-pub struct Label {
-    pub name: String,
-    pub line: usize,
-    pub position: usize,
-}
-
-impl hash::Hash for Label {
-    fn hash<H>(&self, h: &mut H)
-    where
-        H: hash::Hasher,
-    {
-        self.name.hash(h)
-    }
-}
-
-impl std::cmp::PartialEq for Label {
-    fn eq(&self, other: &Label) -> bool {
-        self.name.eq(&other.name)
-    }
-}
-
-impl std::cmp::Eq for Label {}
-
-#[derive(Debug)]
-pub struct Script {
-    pub text: String,
-    pub line: usize,
-    pub position: usize,
-}
-
-#[derive(Debug)]
-pub enum Cmd {
-    // @: script :: text ::
-    // or
-    // @@: script :: tet ::
-    AnonEval(Script),
-    // @ label1 label2 .. :: text ::
-    // or
-    // @@ label1 label2 .. :: text ::
-    Eval(Vec<Label>),
-    // @ label: script
-    // or
-    // @@ label: script @@
-    Decl { label: Label, script: Script },
 }
 
 pub fn collect_chunks_from_stream<'src_lt>(
@@ -545,6 +520,53 @@ pub fn collect_chunks_from_stream<'src_lt>(
     Ok(())
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct Label {
+    pub name: String,
+    pub line: usize,
+    pub position: usize,
+}
+
+impl hash::Hash for Label {
+    fn hash<H>(&self, h: &mut H)
+    where
+        H: hash::Hasher,
+    {
+        self.name.hash(h)
+    }
+}
+
+impl std::cmp::PartialEq for Label {
+    fn eq(&self, other: &Label) -> bool {
+        self.name.eq(&other.name)
+    }
+}
+
+impl std::cmp::Eq for Label {}
+
+#[derive(Debug)]
+pub struct Script {
+    pub text: String,
+    pub line: usize,
+    pub position: usize,
+}
+
+#[derive(Debug)]
+pub enum Cmd {
+    // @: script :: text ::
+    // or
+    // @@: script :: tet ::
+    AnonEval(Script),
+    // @ label1 label2 .. :: text ::
+    // or
+    // @@ label1 label2 .. :: text ::
+    Eval(Vec<Label>),
+    // @ label: script
+    // or
+    // @@ label: script @@
+    Decl { label: Label, script: Script },
+}
+
 // returns None if the chunk is not Cmd or CmdBlock
 pub fn parse_chunk_into_cmd<'src_lt>(
     source: &'src_lt str,
@@ -638,8 +660,8 @@ fn run_bash_script(
     script: &Script,
     script_args: &[&str],
     input_text: &mut String,
-) -> Result<(), String> {
-    // println!("runing script: {script_label}\n{script:?}\n{script_args:?}");
+) -> Result<(), Box<dyn std::error::Error>> {
+    // println!("runing script: {script_label}\n{s}\n{script_args:?}", s = script.text);
 
     let mut child = Command::new("bash")
         .arg("-c")
@@ -649,19 +671,18 @@ fn run_bash_script(
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .spawn()
-        .map_err(to_string)?;
+        .spawn()?;
 
     child
         .stdin
         .take()
         .expect("stdin")
-        .write_all(input_text.as_bytes())
-        .map_err(to_string)?;
+        .write_all(input_text.as_bytes())?;
 
-    if !child.wait().map_err(to_string)?.success() {
-        let stderr = &mut child.stdout.take().expect("stderr");
-        return Err(std::io::read_to_string(stderr).map_err(to_string)?);
+    if !child.wait()?.success() {
+        let stderr = &mut child.stderr.take().expect("stderr");
+
+        return Err(std::io::read_to_string(stderr)?.into());
     }
 
     let stdout = &mut child.stdout.take().expect("stdout");
@@ -768,7 +789,7 @@ fn execute_cmd_eval<'src_lt>(
     });
 }
 
-fn evaluate_cmd<'src_lt>(
+fn execute_cmd<'src_lt>(
     cmd: Cmd,
     input: &mut String,
     decls: &mut HashMap<Label, Script>,
@@ -837,7 +858,7 @@ fn evaluate_chunk<'src_lt>(
         }
         ChunkKind::TextBlock => {
             for cmd in call_stack.drain(..) {
-                evaluate_cmd(cmd, &mut chunk.text, decls, err_stack, source);
+                execute_cmd(cmd, &mut chunk.text, decls, err_stack, source);
             }
         }
         ChunkKind::Whitespaces => (),
@@ -886,19 +907,27 @@ fn collect_nya_files_in_dir(
     dir: &Path,
     found_files: &mut HashMap<usize, PathBuf>,
     chunks_buf: &mut Vec<Chunk>, // needed for recursion
-) -> Result<(), String> {
+) -> Result<bool, String> {
+    let mut all_succeeded = true;
     let entries = std::fs::read_dir(dir)
-        .map_err(|e| format!("failed to read directory `{p}`:\n{e}", p = dir.display()))?;
+        .map_err(|e| format!("failed to read directory `{p}`: {e}", p = dir.display()))?;
+
+    macro_rules! warn {
+        ($($msg:expr),* $(,)?) => {{
+            all_succeeded = false;
+            eprintln!($($msg,)*);
+            continue;
+        }}
+    }
 
     for maybe_entry in entries {
         chunks_buf.clear();
 
-        let entry = maybe_entry.map_err(|e| {
-            format!(
-                "failed to read DirEntry in note directory `{p}`:\n{e}",
-                p = dir.display()
-            )
-        })?;
+        let entry = match maybe_entry {
+            Ok(e) => e,
+            Err(err) => warn!("[Warn] failed to read entry in note directory `{}`:\n{err}", dir.display() ),
+            
+        };
 
         let entry_path = entry.path();
         let entry_fmt = entry_path.display();
@@ -912,44 +941,38 @@ fn collect_nya_files_in_dir(
             let source = match std::fs::read_to_string(&entry_path) {
                 Ok(s) => s,
                 Err(read_err) => {
-                    eprintln!("[Warn] skipping `{entry_fmt}`: {read_err}",);
-                    continue;
+                    warn!("[Warn] skipping `{entry_fmt}`: {read_err}",);
                 }
             };
 
             let mut stream = source.chars().peekable();
             if let Err(parse_err) = collect_chunks_from_stream(&mut stream, 1, chunks_buf, &source)
             {
-                eprintln!("[Warn] skipping `{entry_fmt}`: {parse_err}");
-                continue;
+                warn!("[Warn] skipping `{entry_fmt}`: {parse_err}");
             }
 
             let Some(chunk) = chunks_buf.first() else {
-                eprintln!("[Warn] skipping `{entry_fmt}`: file is empty");
-                continue;
+                warn!("[Warn] skipping `{entry_fmt}`: file is empty");
             };
 
             let idx = match get_index_value_from_chunk(chunk, &source) {
                 Ok(value) => value,
                 Err(err) => {
-                    eprintln!("[Warn] skipping `{entry_fmt}: {err}`");
-                    continue;
+                    warn!("[Warn] skipping `{entry_fmt}: {err}`");
                 }
             };
 
             if let Some(p) = found_files.insert(idx, entry_path.to_path_buf()) {
-                eprintln!(
-                    "[Warn] skipping `{entry_fmt}: duplicate index found `{idx}`, previously declared in `{p2}`",
-                    p2 = p.display()
+                warn!(
+                    "[Warn] skipping `{entry_fmt}: duplicate index found `{idx}`, previously declared in `{}`", p.display()
                 );
-                continue;
             }
         } else if entry_path.is_dir() {
-            collect_nya_files_in_dir(&entry_path, found_files, chunks_buf)?;
+            all_succeeded = collect_nya_files_in_dir(&entry_path, found_files, chunks_buf)?;
         }
     }
 
-    Ok(())
+    Ok(all_succeeded)
 }
 
 fn collect_chunks_from_file(
@@ -973,7 +996,11 @@ fn collect_chunks_from_last_file_in_dir(
     chunks: &mut Vec<Chunk>,
 ) -> Result<(), String> {
     let mut found = HashMap::<usize, PathBuf>::new();
-    collect_nya_files_in_dir(dir, &mut found, chunks).map_err(to_string)?;
+    let all_succeeded = collect_nya_files_in_dir(dir, &mut found, chunks).map_err(to_string)?;
+
+    if !all_succeeded{
+        return Err(format!("there was some issues while reading `{ENV_INPUT_DIRECTORY}`"));
+    }
 
     let Some((_, path)) = found
         .into_iter()
@@ -986,22 +1013,21 @@ fn collect_chunks_from_last_file_in_dir(
     };
 
     chunks.clear();
-    collect_chunks_from_file(&path, source_buf, chunks).map_err(to_string)?;
 
-    Ok(())
+    collect_chunks_from_file(&path, source_buf, chunks).map_err(to_string)
 }
 
 fn main() {
     let (input, output) = match parse_args(std::env::args().skip(1)) {
         Ok(res) => res,
-        Err(e) => return eprintln!("{e}"),
+        Err(e) => return eprintln!("[Err] {e}"),
     };
 
+    let mut source = String::new();
     let mut chunks = Vec::<Chunk>::new();
     let mut decls = HashMap::<Label, Script>::new();
     let mut call_stack = Vec::<Cmd>::new();
     let mut err_stack = Vec::<Error>::new();
-    let mut source = String::new();
 
     let collecting_result = match input {
         Input::File(f) => collect_chunks_from_file(&f, &mut source, &mut chunks),
