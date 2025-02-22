@@ -1,6 +1,6 @@
 use std::{
     collections::HashMap,
-    fmt::{self, Display, Formatter},
+    fmt::{self, Display, Formatter, Write as FmtWrite},
     fs::File,
     hash,
     io::{Read, Write as IoWrite},
@@ -55,8 +55,8 @@ pub enum ErrorKind {
         opening_position: usize,
     },
     UnallowedLabelCharacter(char),
-    UndeclaredLabel(String),
-    LabelRedeclaration(Label), // contains second declaration
+    UndefinedLabel(String),
+    LabelRedefinition(Label), // contains second definition
     EvaluatingScript(String),
     MissingInputTextBlock,
 }
@@ -114,13 +114,13 @@ impl Display for Error<'_> {
             ErrorKind::NonIntegerIndexValue => {
                 writeln!(f, "value for index of file must be an integer")?
             }
-            ErrorKind::UndeclaredLabel(label_name) => {
-                writeln!(f, "trying to access undeclared label `{label_name}`")?
+            ErrorKind::UndefinedLabel(label_name) => {
+                writeln!(f, "trying to access undefined label `{label_name}`")?
             }
             ErrorKind::MissingInputTextBlock => {
                 writeln!(f, "expected `TextBlock` as input for commands:")?
             }
-            ErrorKind::LabelRedeclaration(second) => {
+            ErrorKind::LabelRedefinition(second) => {
                 let name = &second.name;
 
                 writeln!(f, "label `{name}` already exist:")?;
@@ -128,7 +128,7 @@ impl Display for Error<'_> {
 
                 writeln!(
                     f,
-                    "{ptr:->5} previous declaration at {}:{} here:",
+                    "{ptr:->5} previous definition at {}:{} here:",
                     second.line,
                     second.position,
                     ptr = ">",
@@ -141,7 +141,7 @@ impl Display for Error<'_> {
                 writeln!(f, "unallawed label character `{ch}`, bruh:")?
             }
             ErrorKind::EvaluatingScript(err) => {
-                writeln!(f, "script error:")?; // TODO: proper formatting
+                writeln!(f, "script error:")?;
                 for l in err.lines() {
                     writeln!(f, "{ptr:->5} {l}", ptr = ">")?;
                 }
@@ -248,9 +248,18 @@ fn parse_args(
     let input = mb_input
         .or_else(|| env_dir.map(PathBuf::from).map(Input::Dir))
         .ok_or_else(|| {
-            format!("either provide an input `.nya` file with `-i` flag or set `{ENV_INPUT_DIRECTORY}`")
+            format!(
+                "either provide an input `.nya` file with `-i` flag or set `{ENV_INPUT_DIRECTORY}`"
+            )
         })?;
 
+    // throw error before evaluation
+    // input path will be checked later with `read_to_string`
+    if let Output::File(f) = &output {
+        if f.exists() {
+            return Err(format!("`{}` already exists", f.display()).into());
+        }
+    }
 
     Ok((input, output))
 }
@@ -564,10 +573,9 @@ pub enum Cmd {
     // @ label: script
     // or
     // @@ label: script @@
-    Decl { label: Label, script: Script },
+    Define { label: Label, script: Script },
 }
 
-// returns None if the chunk is not Cmd or CmdBlock
 pub fn parse_chunk_into_cmd<'src_lt>(
     source: &'src_lt str,
     chunk: &Chunk,
@@ -610,7 +618,7 @@ pub fn parse_chunk_into_cmd<'src_lt>(
                     position: cursor_position,
                 };
 
-                return Ok(Cmd::Decl { label, script });
+                return Ok(Cmd::Define { label, script });
             }
 
             // @ <label1> <label2> ...
@@ -692,21 +700,21 @@ fn run_bash_script(
     Ok(())
 }
 
-fn execute_cmd_decl<'src_lt>(
+fn execute_cmd_define<'src_lt>(
     label: Label,
     script: Script,
-    decls: &mut HashMap<Label, Script>,
+    defines: &mut HashMap<Label, Script>,
     err_stack: &mut Vec<Error<'src_lt>>,
     source: &'src_lt str,
 ) {
-    let Some((existing_label, _)) = decls.remove_entry(&label) else {
-        let _ = decls.insert(label, script);
+    let Some((existing_label, _)) = defines.remove_entry(&label) else {
+        let _ = defines.insert(label, script);
         return;
     };
 
     err_stack.push(Error {
         source,
-        kind: ErrorKind::LabelRedeclaration(existing_label),
+        kind: ErrorKind::LabelRedefinition(existing_label),
         line: label.line,
         position: label.position,
     });
@@ -735,7 +743,7 @@ fn execute_cmd_anon_eval<'src_lt>(
 fn execute_cmd_eval<'src_lt>(
     labels: Vec<Label>,
     input: &mut String,
-    decls: &HashMap<Label, Script>,
+    defines: &HashMap<Label, Script>,
     err_stack: &mut Vec<Error<'src_lt>>,
     source: &'src_lt str,
 ) {
@@ -744,7 +752,7 @@ fn execute_cmd_eval<'src_lt>(
     let mut abort = false;
 
     for l in labels {
-        let Some((label, script)) = decls.get_key_value(&l) else {
+        let Some((label, script)) = defines.get_key_value(&l) else {
             abort = true;
             let Label {
                 name,
@@ -754,7 +762,7 @@ fn execute_cmd_eval<'src_lt>(
 
             err_stack.push(Error {
                 source,
-                kind: ErrorKind::UndeclaredLabel(name),
+                kind: ErrorKind::UndefinedLabel(name),
                 line,
                 position,
             });
@@ -792,14 +800,14 @@ fn execute_cmd_eval<'src_lt>(
 fn execute_cmd<'src_lt>(
     cmd: Cmd,
     input: &mut String,
-    decls: &mut HashMap<Label, Script>,
+    defines: &mut HashMap<Label, Script>,
     err_stack: &mut Vec<Error<'src_lt>>,
     source: &'src_lt str,
 ) {
     match cmd {
         Cmd::AnonEval(script) => execute_cmd_anon_eval(&script, input, err_stack, source),
-        Cmd::Eval(labels) => execute_cmd_eval(labels, input, decls, err_stack, source),
-        Cmd::Decl { label, script } => execute_cmd_decl(label, script, decls, err_stack, source),
+        Cmd::Eval(labels) => execute_cmd_eval(labels, input, defines, err_stack, source),
+        Cmd::Define { label, script } => execute_cmd_define(label, script, defines, err_stack, source),
     }
 }
 
@@ -826,7 +834,7 @@ fn update_index_chunk<'src_lt>(
 
 fn evaluate_chunk<'src_lt>(
     chunk: &mut Chunk,
-    decls: &mut HashMap<Label, Script>,
+    defines: &mut HashMap<Label, Script>,
     call_stack: &mut Vec<Cmd>,
     err_stack: &mut Vec<Error<'src_lt>>,
     source: &'src_lt str,
@@ -858,7 +866,7 @@ fn evaluate_chunk<'src_lt>(
         }
         ChunkKind::TextBlock => {
             for cmd in call_stack.drain(..) {
-                execute_cmd(cmd, &mut chunk.text, decls, err_stack, source);
+                execute_cmd(cmd, &mut chunk.text, defines, err_stack, source);
             }
         }
         ChunkKind::Whitespaces => (),
@@ -912,7 +920,7 @@ fn collect_nya_files_in_dir(
     let entries = std::fs::read_dir(dir)
         .map_err(|e| format!("failed to read directory `{p}`: {e}", p = dir.display()))?;
 
-    macro_rules! warn {
+    macro_rules! skip {
         ($($msg:expr),* $(,)?) => {{
             all_succeeded = false;
             eprintln!($($msg,)*);
@@ -925,8 +933,10 @@ fn collect_nya_files_in_dir(
 
         let entry = match maybe_entry {
             Ok(e) => e,
-            Err(err) => warn!("[Warn] failed to read entry in note directory `{}`:\n{err}", dir.display() ),
-            
+            Err(err) => skip!(
+                "[Warn] failed to read entry in note directory `{}`:\n{err}",
+                dir.display()
+            ),
         };
 
         let entry_path = entry.path();
@@ -941,30 +951,31 @@ fn collect_nya_files_in_dir(
             let source = match std::fs::read_to_string(&entry_path) {
                 Ok(s) => s,
                 Err(read_err) => {
-                    warn!("[Warn] skipping `{entry_fmt}`: {read_err}",);
+                    skip!("[Warn] skipping `{entry_fmt}`: {read_err}",);
                 }
             };
 
             let mut stream = source.chars().peekable();
             if let Err(parse_err) = collect_chunks_from_stream(&mut stream, 1, chunks_buf, &source)
             {
-                warn!("[Warn] skipping `{entry_fmt}`: {parse_err}");
+                skip!("[Warn] skipping `{entry_fmt}`: {parse_err}");
             }
 
             let Some(chunk) = chunks_buf.first() else {
-                warn!("[Warn] skipping `{entry_fmt}`: file is empty");
+                skip!("[Warn] skipping `{entry_fmt}`: file is empty");
             };
 
             let idx = match get_index_value_from_chunk(chunk, &source) {
                 Ok(value) => value,
                 Err(err) => {
-                    warn!("[Warn] skipping `{entry_fmt}: {err}`");
+                    skip!("[Warn] skipping `{entry_fmt}: {err}`");
                 }
             };
 
             if let Some(p) = found_files.insert(idx, entry_path.to_path_buf()) {
-                warn!(
-                    "[Warn] skipping `{entry_fmt}: duplicate index found `{idx}`, previously declared in `{}`", p.display()
+                skip!(
+                    "[Warn] skipping `{entry_fmt}: duplicate index found `{idx}`, previously defineded in `{}`",
+                    p.display()
                 );
             }
         } else if entry_path.is_dir() {
@@ -998,22 +1009,31 @@ fn collect_chunks_from_last_file_in_dir(
     let mut found = HashMap::<usize, PathBuf>::new();
     let all_succeeded = collect_nya_files_in_dir(dir, &mut found, chunks).map_err(to_string)?;
 
-    if !all_succeeded{
-        return Err(format!("there was some issues while reading `{ENV_INPUT_DIRECTORY}`"));
+    if !all_succeeded {
+        return Err(format!(
+            "there was some issues while reading `{}`",
+            dir.display()
+        ));
     }
 
     let Some((_, path)) = found
         .into_iter()
         .max_by(|(k, _), (other_k, _)| k.cmp(other_k))
     else {
-        return Err(format!(
-            "`{}` doesn't contain any `.nya` file",
-            dir.display()
-        ));
+        eprintln!("[Warn] `{}` doesn't contain any `.nya` file, creating first one", dir.display());
+
+        chunks.clear();
+        chunks.push(Chunk {
+            text: " 1".into(),
+            kind: ChunkKind::Index,
+            position: 1,
+            line: 1,
+        });
+
+        return Ok(());
     };
 
     chunks.clear();
-
     collect_chunks_from_file(&path, source_buf, chunks).map_err(to_string)
 }
 
@@ -1025,7 +1045,7 @@ fn main() {
 
     let mut source = String::new();
     let mut chunks = Vec::<Chunk>::new();
-    let mut decls = HashMap::<Label, Script>::new();
+    let mut defines = HashMap::<Label, Script>::new();
     let mut call_stack = Vec::<Cmd>::new();
     let mut err_stack = Vec::<Error>::new();
 
@@ -1041,7 +1061,7 @@ fn main() {
     // println!("pre eval {chunks:#?}");
 
     for chunk in &mut chunks {
-        evaluate_chunk(chunk, &mut decls, &mut call_stack, &mut err_stack, &source)
+        evaluate_chunk(chunk, &mut defines, &mut call_stack, &mut err_stack, &source)
     }
 
     // println!("post eval: {chunks:#?}");
@@ -1067,7 +1087,7 @@ fn main() {
 
     source.clear();
     for chunk in chunks {
-        source.push_str(&chunk.to_string());
+        let _ = write!(&mut source, "{}", chunk);
     }
 
     let output_path = match output {
