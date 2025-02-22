@@ -1,5 +1,5 @@
 ## Mnya
-Means *"make nya"*, where *"nya"* is the file suffix, which is the sound that anime girls does.
+Means *"make nya"*, where *"nya"* is the file suffix, which is the sound that anime girls do.
 
 Idk what the hell this is and why you would use it. I needed it for note-taking with some scriptable features.
 Basically, it turned to be some sort of crippled shell script preprocessor+executor, yeah.  
