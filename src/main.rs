@@ -8,6 +8,8 @@ use std::{
     process::{Command, Stdio},
 };
 
+// TODO: when we are returning a last file,
+//      return chunk containing index and stream to continure parsing instead of reparsing file again
 const ENV_INPUT_DIRECTORY: &str = "NYA_DIRECTORY";
 
 const USAGE: &str = "Usage:
@@ -337,17 +339,23 @@ impl Iterator for TwoCharsWindowIter<'_> {
         let i = self.idx;
         let t = self.source_bytes;
 
+        if let Some(prev_ch) = i
+            .checked_sub(1)
+            .and_then(|pi| t.get(pi))
+            .map(|b| *b as char)
+        {
+            if prev_ch == '\n' {
+                self.cursor_line += 1;
+                self.cursor_position = 1;
+            } else {
+                self.cursor_position += 1;
+            }
+        }
+
         let first = t.get(i).map(|b| *b as char)?;
         let mb_second = t.get(i + 1).map(|b| *b as char);
 
         self.idx += 1;
-
-        if first == '\n' {
-            self.cursor_line += 1;
-            self.cursor_position = 1;
-        } else {
-            self.cursor_position += 1;
-        }
 
         Some((first, mb_second))
     }
@@ -441,7 +449,7 @@ impl Display for Chunk {
     }
 }
 
-fn collect_next_chunk<'src_lt>(
+fn parse_chunk<'src_lt>(
     stream: &mut TwoCharsWindowIter<'src_lt>,
 ) -> Option<Result<Chunk, Error<'src_lt>>> {
     let mut chunk = Chunk::default();
@@ -490,8 +498,11 @@ fn collect_next_chunk<'src_lt>(
             }));
         };
     }
-
     while let Some(next_chs) = stream.next() {
+        println!(
+            "{}:{} {} {next_chs:?}",
+            stream.cursor_line, stream.cursor_position, stream.idx
+        );
         // TODO: maybe a way to escape '::' '@' '@@' ?
         match chunk.kind {
             // Index = '@# ..'
@@ -632,7 +643,7 @@ pub enum Cmd {
     Define { label: Label, script: Script },
 }
 
-pub fn parse_chunk_into_cmd<'src_lt>(
+pub fn parse_cmd_from_chunk<'src_lt>(
     source: &'src_lt str,
     chunk: &Chunk,
 ) -> Result<Cmd, Error<'src_lt>> {
@@ -642,11 +653,7 @@ pub fn parse_chunk_into_cmd<'src_lt>(
     let mut cursor_position = chunk.position;
     let mut chars = chunk.text.chars().peekable();
 
-    'chars_loop: loop {
-        let Some(ch) = chars.next() else {
-            break 'chars_loop;
-        };
-
+    while let Some(ch) = chars.next() {
         match (args.len(), ch) {
             // @: <script>
             // or
@@ -862,7 +869,7 @@ fn evaluate_chunk<'src_lt>(
 ) {
     match chunk.kind {
         ChunkKind::OneLineCmd | ChunkKind::CmdBlock { .. } => {
-            match parse_chunk_into_cmd(source, chunk) {
+            match parse_cmd_from_chunk(source, chunk) {
                 Ok(cmd) => call_stack.push(cmd),
                 Err(e) => err_stack.push(e),
             }
@@ -985,7 +992,7 @@ fn collect_nya_files_in_dir(
         let mut stream = TwoCharsWindowIter::from(source.as_str());
 
         let idx_chunk = 'searching_chunk: loop {
-            match collect_next_chunk(&mut stream) {
+            match parse_chunk(&mut stream) {
                 Some(Ok(Chunk {
                     kind: ChunkKind::Whitespaces,
                     ..
@@ -1027,7 +1034,7 @@ fn read_nya_file(path: &Path) -> Result<(String, Vec<Chunk>), String> {
     let source_buf = std::fs::read_to_string(path).map_err(to_string)?;
     let mut stream = TwoCharsWindowIter::from(source_buf.as_str());
 
-    while let Some(res) = collect_next_chunk(&mut stream) {
+    while let Some(res) = parse_chunk(&mut stream) {
         chunks_buf.push(res.map_err(to_string)?);
     }
 
@@ -1145,7 +1152,7 @@ fn handle_file_input(path: PathBuf, output: Output) {
                 print!("{chunk}");
             }
             return;
-        },
+        }
         Output::File(p) => p,
     };
 
