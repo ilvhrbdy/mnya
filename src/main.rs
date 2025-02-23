@@ -240,6 +240,7 @@ fn parse_args(
             std::env::current_dir()?
         };
 
+        output_name.push_str(".nya");
         path.push(output_name);
 
         Output::File(path)
@@ -1101,7 +1102,7 @@ fn handle_file_input(path: PathBuf, output: Output) {
     let mut call_stack = Vec::<Cmd>::new();
     let mut err_stack = Vec::<Error>::new();
 
-    let (source, mut chunks) = match read_nya_file(&path) {
+    let (mut source, mut chunks) = match read_nya_file(&path) {
         Ok(s) => s,
         Err(e) => return eprintln!("[Err] in {}:\n{e}", path.display()),
     };
@@ -1150,6 +1151,7 @@ fn handle_file_input(path: PathBuf, output: Output) {
 
     let path_fmt = output_path.display();
 
+    source.clear();
     if let Err(e) = create_new_nya(&output_path, source, chunks) {
         return eprintln!("[Err] failed to create {path_fmt}: {e}");
     }
