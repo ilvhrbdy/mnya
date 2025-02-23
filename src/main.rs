@@ -4,7 +4,6 @@ use std::{
     fs::File,
     hash,
     io::{Read, Write as IoWrite},
-    iter::Peekable,
     path::{Path, PathBuf},
     process::{Command, Stdio},
 };
@@ -19,12 +18,12 @@ Flags:
     -print              - write to STDOUT instead of a file
     -i <INPUT FILE>     - evaluate input file instead of reading NYA_DIRECTORY;
                           PWD will be used to create output file,
-                          if neither `NYA_DIRECTORY` nor `-print` is provided
+                          if neither NYA_DIRECTORY nor -print is provided
 
 Env:
     NYA_DIRECTORY      - default nya folder; act as working directory
 
-<OUTPUT FILE NAME> could be built from multiple arguments that do not start with `-`
+<OUTPUT FILE NAME> could be built from multiple arguments that do not start with -
 After successful evaluation, the path to the output file will be printed to STDOUT.
 All of the [Err] and [Warn] will be printed to STDERR.";
 
@@ -46,7 +45,7 @@ fn to_string(e: impl Display) -> String {
 }
 
 #[derive(Debug)]
-pub enum ErrorKind {
+enum ErrorKind {
     NoIndexChunk,
     NonIntegerIndexValue,
     UnclosedDelimiter {
@@ -109,21 +108,21 @@ impl Display for Error<'_> {
 
         match &self.kind {
             ErrorKind::NoIndexChunk => {
-                writeln!(f, "first command must be file index chunk: `@# <index>`")?
+                writeln!(f, "first command must be file index chunk: @# <index>")?
             }
             ErrorKind::NonIntegerIndexValue => {
                 writeln!(f, "value for index of file must be an integer")?
             }
             ErrorKind::UndefinedLabel(label_name) => {
-                writeln!(f, "trying to access undefined label `{label_name}`")?
+                writeln!(f, "trying to access undefined label {label_name}")?
             }
             ErrorKind::MissingInputTextBlock => {
-                writeln!(f, "expected `TextBlock` as input for commands:")?
+                writeln!(f, "expected TextBlock as input for commands:")?
             }
             ErrorKind::LabelRedefinition(second) => {
                 let name = &second.name;
 
-                writeln!(f, "label `{name}` already exist:")?;
+                writeln!(f, "label {name} already exist:")?;
                 point_on_err(f, err_line, err_position, self.source)?;
 
                 writeln!(
@@ -138,7 +137,7 @@ impl Display for Error<'_> {
                 return Ok(());
             }
             ErrorKind::UnallowedLabelCharacter(ch) => {
-                writeln!(f, "unallawed label character `{ch}`, bruh:")?
+                writeln!(f, "unallawed label character {ch}, bruh:")?
             }
             ErrorKind::EvaluatingScript(err) => {
                 writeln!(f, "script error:")?;
@@ -156,7 +155,7 @@ impl Display for Error<'_> {
 
                 writeln!(
                     f,
-                    "unclosed chunk delimiter `{delimiter}`\n---> starts at {delim_line}:{delim_position} here:"
+                    "unclosed chunk delimiter {delimiter}\n---> starts at {delim_line}:{delim_position} here:"
                 )?;
                 point_on_err(f, *delim_line, delim_position, self.source)?;
 
@@ -209,17 +208,13 @@ fn parse_args(
     let mut output_name = String::new();
     let env_dir = std::env::var(ENV_INPUT_DIRECTORY).ok().map(expanded);
 
-    loop {
-        let Some(arg) = args.next() else {
-            break;
-        };
-
+    while let Some(arg) = args.next() {
         match arg.as_str() {
             "-h" => return Err(USAGE.into()),
             "-print" => mb_output = Some(Output::Stdout),
             "-i" => match args.next() {
                 Some(file_name) => mb_input = Some(Input::File(PathBuf::from(file_name))),
-                None => return Err("input file for `-i` flag where?".into()),
+                None => return Err("input file for -i flag where?".into()),
             },
             a if a.starts_with("-") => {
                 return Err("i don't know what this flag means..".into());
@@ -232,8 +227,13 @@ fn parse_args(
         }
     }
 
-    if !matches!(mb_output, Some(Output::Stdout)) {
+    let output = if let Some(out @ Output::Stdout) = mb_output {
+        out
+    } else if output_name.trim().is_empty() {
+        return Err("throw some words for enw note file name".into());
+    } else {
         let _ = output_name.pop(); // remove trailing '_'
+
         let mut path = if let Some(dir) = &env_dir {
             PathBuf::from(dir)
         } else {
@@ -241,27 +241,127 @@ fn parse_args(
         };
 
         path.push(output_name);
-        mb_output = Some(Output::File(path));
-    }
 
-    let output = mb_output.ok_or("throw some words for new note file name!")?;
+        Output::File(path)
+    };
+
     let input = mb_input
         .or_else(|| env_dir.map(PathBuf::from).map(Input::Dir))
         .ok_or_else(|| {
-            format!(
-                "either provide an input `.nya` file with `-i` flag or set `{ENV_INPUT_DIRECTORY}`"
-            )
+            format!("either provide an input .nya file with -i flag or set {ENV_INPUT_DIRECTORY}")
         })?;
 
     // throw error before evaluation
-    // input path will be checked later with `read_to_string`
+    // input path will be checked later with read_to_string
     if let Output::File(f) = &output {
         if f.exists() {
-            return Err(format!("`{}` already exists", f.display()).into());
+            return Err(format!("{} already exists", f.display()).into());
         }
     }
 
     Ok((input, output))
+}
+
+fn run_bash_script(
+    script_label: &str,
+    script: &Script,
+    script_args: &[&str],
+    input_text: &mut String,
+) -> Result<(), Box<dyn std::error::Error>> {
+    // println!("runing script: {script_label}\n{s}\n{script_args:?}", s = script.text);
+
+    let mut child = Command::new("bash")
+        .arg("-c")
+        .arg(&script.text)
+        .arg(script_label) // $0, doesn't do anything
+        .args(script_args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+
+    child
+        .stdin
+        .take()
+        .expect("stdin")
+        .write_all(input_text.as_bytes())?;
+
+    if !child.wait()?.success() {
+        let stderr = &mut child.stderr.take().expect("stderr");
+
+        return Err(std::io::read_to_string(stderr)?.into());
+    }
+
+    let stdout = &mut child.stdout.take().expect("stdout");
+    input_text.clear();
+    stdout.read_to_string(input_text).map_err(to_string)?;
+
+    Ok(())
+}
+
+#[derive(Debug)]
+struct TwoCharsWindowIter<'src_lt> {
+    source: &'src_lt str,
+    source_bytes: &'src_lt [u8],
+    idx: usize,
+    cursor_line: usize,
+    cursor_position: usize,
+}
+
+impl TwoCharsWindowIter<'_> {
+    fn back(&mut self) {
+        let new_idx = self.idx.saturating_sub(1);
+
+        if self.idx == new_idx {
+            return;
+        }
+
+        self.idx = new_idx;
+        let prev_ch = self.source_bytes[new_idx] as char;
+
+        if prev_ch != '\n' {
+            self.cursor_position -= 1;
+            return;
+        }
+
+        self.cursor_line -= 1;
+        self.cursor_position = self.source.lines().nth(self.cursor_line).unwrap().len();
+    }
+}
+
+impl Iterator for TwoCharsWindowIter<'_> {
+    type Item = (char, Option<char>);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let i = self.idx;
+        let t = self.source_bytes;
+
+        let first = t.get(i).map(|b| *b as char)?;
+        let mb_second = t.get(i + 1).map(|b| *b as char);
+
+        self.idx += 1;
+
+        if first == '\n' {
+            self.cursor_line += 1;
+            self.cursor_position = 1;
+        } else {
+            self.cursor_position += 1;
+        }
+
+        Some((first, mb_second))
+    }
+}
+
+impl<'sl> From<&'sl str> for TwoCharsWindowIter<'sl> {
+    fn from(source: &'sl str) -> Self {
+        Self {
+            source,
+            source_bytes: source.as_bytes(),
+            idx: 0,
+            cursor_line: 1,
+            cursor_position: 1,
+        }
+    }
 }
 
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
@@ -340,193 +440,148 @@ impl Display for Chunk {
     }
 }
 
-pub fn collect_chunks_from_stream<'src_lt>(
-    stream: &mut Peekable<impl Iterator<Item = char>>,
-    n_chunks: usize,
-    chunks_buf: &mut Vec<Chunk>,
-    source: &'src_lt str, // for error reporting
-) -> Result<(), Error<'src_lt>> {
-    let mut text = String::new();
-    let mut collecting_kind = ChunkKind::Whitespaces;
-    let mut collected_chunks_count = 0;
+fn collect_next_chunk<'src_lt>(
+    stream: &mut TwoCharsWindowIter<'src_lt>,
+) -> Option<Result<Chunk, Error<'src_lt>>> {
+    let mut chunk = Chunk::default();
 
-    let mut chunk_start_line = 1;
-    let mut chunk_start_position = 1;
+    let is_useless =
+        |chunk: &Chunk| matches!(chunk.kind, ChunkKind::Whitespaces) && chunk.text.is_empty();
 
-    let mut cursor_line = 1;
-    let mut cursor_position = 1;
-
-    // idk how to call it
-    macro_rules! state {
-        (push) => {{
-            let chunk_is_empty_whitespace =
-                matches!(collecting_kind, ChunkKind::Whitespaces) && text.is_empty();
-
-            if !chunk_is_empty_whitespace {
-                // with this chunk.position will point on the start of the text
-                let delim_len = collecting_kind.delimiters().0.len();
-
-                chunks_buf.push(Chunk {
-                    text: text.clone(),
-                    kind: collecting_kind,
-                    line: chunk_start_line,
-                    position: chunk_start_position + delim_len,
-                });
-            }
-
-            !chunk_is_empty_whitespace
-        }};
+    macro_rules! start_chunk {
         ($kind:expr) => {{
-            if state!(push) {
-                collected_chunks_count += 1;
+            chunk.kind = $kind;
+            let (opening, _) = chunk.kind.delimiters();
+            let delim_len = opening.len();
+            chunk.position = delim_len + stream.cursor_position;
+            chunk.line = stream.cursor_line;
+
+            // first char of delim is eaten at this point
+            for _ in 0..delim_len.saturating_sub(1) {
+                let _ = stream.next();
             }
-            chunk_start_line = cursor_line;
-            chunk_start_position = cursor_position;
-            collecting_kind = $kind;
-            text.clear();
+        }};
+    }
+
+    macro_rules! close_and_return_chunk {
+        () => {{
+            let (_, closing) = chunk.kind.delimiters();
+            // first char of delim is eaten at this point
+            for _ in 0..closing.len().saturating_sub(1) {
+                let _ = stream.next();
+            }
+            return Some(Ok(chunk));
         }};
     }
 
     macro_rules! return_err_unclosed {
-        ($delim:expr) => {
-            return Err(Error {
-                source,
-                line: cursor_line,
-                position: cursor_position,
+        () => {
+            let (opening, closing) = chunk.kind.delimiters();
+            return Some(Err(Error {
+                source: stream.source,
+                line: stream.cursor_line,
+                position: stream.cursor_position,
                 kind: ErrorKind::UnclosedDelimiter {
-                    delimiter: $delim,
-                    opening_line: chunk_start_line,
-                    opening_position: chunk_start_position,
+                    delimiter: closing,
+                    opening_line: chunk.line,
+                    opening_position: chunk.position - opening.len(),
                 },
-            });
+            }));
         };
     }
 
-    while collected_chunks_count < n_chunks {
-        let mb_ch = stream.next();
-        let mb_next_ch = stream.peek();
-
-        // *mega master super print debugger*
-        // println!("{mb_ch:?} {mbnext_ch:?} {collecting_kind:?} {cursor_line}:{cursor_position}");
-
+    while let Some(next_chs) = stream.next() {
         // TODO: maybe a way to escape '::' '@' '@@' ?
-        match collecting_kind {
+        match chunk.kind {
             // Index = '@# ..'
             // Cmd = '@ ...'
             // collect until  '\n' or '::' or 'EOF'
-            ChunkKind::Index | ChunkKind::OneLineCmd => match (mb_ch, mb_next_ch) {
-                (Some(':'), Some(':')) => {
-                    let _ = stream.next(); // remove second ':' from the iterator
-                    cursor_position += 1;
-                    state!(ChunkKind::TextBlock);
+            ChunkKind::Index | ChunkKind::OneLineCmd => match next_chs {
+                (':', Some(':')) => {
+                    stream.back();
+                    return Some(Ok(chunk));
                 }
-                (Some(ch), next_ch) => {
-                    if next_ch.is_none() {
-                        let _ = state!(push);
-                        break;
-                    } else if ch == '\n' {
-                        state!(ChunkKind::Whitespaces);
+                ('\n', _) => {
+                    stream.back();
+                    return Some(Ok(chunk));
+                }
+                (ch, mb_next) => {
+                    chunk.text.push(ch);
+                    if mb_next.is_none() {
+                        return Some(Ok(chunk));
                     }
-
-                    text.push(ch);
                 }
-                _ => break,
             },
             // Text = ':: .. ::'
             // collect until '::'
-            ChunkKind::TextBlock => match (mb_ch, mb_next_ch) {
-                (Some(':'), Some(':')) => {
-                    state!(ChunkKind::Whitespaces);
-
-                    let _ = stream.next(); // remove second ':' from the iterator
-                    cursor_position += 1;
-                }
-                (Some(ch), next_ch) => {
-                    text.push(ch);
-
+            ChunkKind::TextBlock => match next_chs {
+                (':', Some(':')) => close_and_return_chunk!(),
+                (ch, next_ch) => {
+                    chunk.text.push(ch);
                     if next_ch.is_none() {
-                        return_err_unclosed!("::");
+                        return_err_unclosed!();
                     }
                 }
-                _ => break,
             },
             // CmdBlock = '@@ .. @@'
             // collect until '@@'
             ChunkKind::CmdBlock {
                 ref mut closed_by_self,
-            } => match (mb_ch, mb_next_ch) {
-                (Some(':'), Some(':')) => {
+            } => match next_chs {
+                (':', Some(':')) => {
                     *closed_by_self = false;
-                    state!(ChunkKind::TextBlock);
-
-                    let _ = stream.next(); // remove second ':' from the iterator
-                    cursor_position += 1;
+                    stream.back();
+                    return Some(Ok(chunk));
                 }
-                (Some('@'), Some('@')) => {
+                ('@', Some('@')) => {
                     *closed_by_self = true;
-                    state!(ChunkKind::Whitespaces);
-
-                    let _ = stream.next(); // remove second '@' from the iterator
-                    cursor_position += 1;
+                    close_and_return_chunk!();
                 }
-                (Some(ch), next_ch) => {
-                    text.push(ch);
+                (ch, next_ch) => {
+                    chunk.text.push(ch);
                     if next_ch.is_none() {
-                        return_err_unclosed!("@@");
+                        return_err_unclosed!();
                     }
                 }
-                _ => break,
             },
-            ChunkKind::DiscardedText | ChunkKind::Whitespaces => match (mb_ch, mb_next_ch) {
-                (Some('@'), Some('#')) => {
-                    state!(ChunkKind::Index);
-
-                    let _ = stream.next(); // remove '#' from the iterator
-                    cursor_position += 1;
-                }
-                (Some(':'), Some(':')) => {
-                    state!(ChunkKind::TextBlock);
-
-                    let _ = stream.next(); // remove second ':' from the iterator
-                    cursor_position += 1;
-                }
-                (Some('@'), Some('@')) => {
-                    state!(ChunkKind::CmdBlock {
-                        closed_by_self: false
-                    });
-
-                    let _ = stream.next(); // remove second '@' from the iterator
-                    cursor_position += 1;
-                }
-                (Some(ch), next_ch) => {
-                    if ch == '@' {
-                        state!(ChunkKind::OneLineCmd);
-                    } else if matches!(collecting_kind, ChunkKind::Whitespaces) {
-                        if ch.is_whitespace() {
-                            text.push(ch);
+            ChunkKind::DiscardedText | ChunkKind::Whitespaces => {
+                let current_is_useless = is_useless(&chunk);
+                macro_rules! start_if_useless {
+                    ($kind:expr) => {{
+                        if current_is_useless {
+                            start_chunk!($kind);
                         } else {
-                            state!(ChunkKind::DiscardedText);
+                            stream.back();
+                            return Some(Ok(chunk));
+                        }
+                    }};
+                }
+
+                match next_chs {
+                    ('@', Some('#')) => start_if_useless!(ChunkKind::Index),
+                    (':', Some(':')) => start_if_useless!(ChunkKind::TextBlock),
+                    ('@', Some('@')) => start_if_useless!(ChunkKind::CmdBlock {
+                        closed_by_self: false
+                    }),
+                    ('@', _) => start_if_useless!(ChunkKind::OneLineCmd),
+                    (ch, _) if chunk.kind == ChunkKind::Whitespaces => {
+                        if ch.is_whitespace() {
+                            chunk.text.push(ch);
+                        } else {
+                            start_if_useless!(ChunkKind::DiscardedText);
                         }
                     }
-
-                    if next_ch.is_none() {
-                        let _ = state!(push);
-                        break;
-                    }
+                    _ => (),
                 }
-                _ => break,
-            },
-        }
-
-        if let Some('\n') = mb_ch {
-            cursor_line += 1;
-            cursor_position = 1;
-        } else {
-            cursor_position += 1;
+            }
         }
     }
 
-    Ok(())
+    if is_useless(&chunk) {
+        return None;
+    }
+
+    Some(Ok(chunk))
 }
 
 #[derive(Debug, Clone, Default)]
@@ -663,43 +718,6 @@ pub fn parse_chunk_into_cmd<'src_lt>(
     Ok(Cmd::Eval(args))
 }
 
-fn run_bash_script(
-    script_label: &str,
-    script: &Script,
-    script_args: &[&str],
-    input_text: &mut String,
-) -> Result<(), Box<dyn std::error::Error>> {
-    // println!("runing script: {script_label}\n{s}\n{script_args:?}", s = script.text);
-
-    let mut child = Command::new("bash")
-        .arg("-c")
-        .arg(&script.text)
-        .arg(script_label) // $0, doesn't do anything
-        .args(script_args)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()?;
-
-    child
-        .stdin
-        .take()
-        .expect("stdin")
-        .write_all(input_text.as_bytes())?;
-
-    if !child.wait()?.success() {
-        let stderr = &mut child.stderr.take().expect("stderr");
-
-        return Err(std::io::read_to_string(stderr)?.into());
-    }
-
-    let stdout = &mut child.stdout.take().expect("stdout");
-    input_text.clear();
-    stdout.read_to_string(input_text).map_err(to_string)?;
-
-    Ok(())
-}
-
 fn execute_cmd_define<'src_lt>(
     label: Label,
     script: Script,
@@ -807,7 +825,9 @@ fn execute_cmd<'src_lt>(
     match cmd {
         Cmd::AnonEval(script) => execute_cmd_anon_eval(&script, input, err_stack, source),
         Cmd::Eval(labels) => execute_cmd_eval(labels, input, defines, err_stack, source),
-        Cmd::Define { label, script } => execute_cmd_define(label, script, defines, err_stack, source),
+        Cmd::Define { label, script } => {
+            execute_cmd_define(label, script, defines, err_stack, source)
+        }
     }
 }
 
@@ -822,7 +842,7 @@ fn update_index_chunk<'src_lt>(
     let in_text_idx_pos = chunk
         .text
         .find(|ch: char| ch.is_numeric())
-        .expect("integer must be validated by `get_index_value_from_chunk`");
+        .expect("integer must be validated by get_index_value_from_chunk");
     let idx_range = in_text_idx_pos..(in_text_idx_pos + in_text_idx_len);
     chunk.text.replace_range(idx_range, &nex_idx.to_string());
 
@@ -914,29 +934,29 @@ fn get_index_value_from_chunk<'src_lt>(
 fn collect_nya_files_in_dir(
     dir: &Path,
     found_files: &mut HashMap<usize, PathBuf>,
-    chunks_buf: &mut Vec<Chunk>, // needed for recursion
 ) -> Result<bool, String> {
     let mut all_succeeded = true;
-    let entries = std::fs::read_dir(dir)
-        .map_err(|e| format!("failed to read directory `{p}`: {e}", p = dir.display()))?;
+    let dir_fmt = dir.display();
+    let entries =
+        std::fs::read_dir(dir).map_err(|e| format!("failed to read directory {dir_fmt}: {e}"))?;
 
-    macro_rules! skip {
-        ($($msg:expr),* $(,)?) => {{
-            all_succeeded = false;
-            eprintln!($($msg,)*);
-            continue;
-        }}
-    }
-
-    for maybe_entry in entries {
-        chunks_buf.clear();
+    'entries_loop: for maybe_entry in entries {
+        macro_rules! go_next {
+            ($lbl:lifetime, $msg:expr) => {{
+                all_succeeded = false;
+                eprintln!($msg);
+                continue $lbl;
+            }};
+            ($msg:expr) => {{
+                go_next!('entries_loop, $msg);
+            }}
+        }
 
         let entry = match maybe_entry {
             Ok(e) => e,
-            Err(err) => skip!(
-                "[Warn] failed to read entry in note directory `{}`:\n{err}",
-                dir.display()
-            ),
+            Err(err) => {
+                go_next!("[Warn] failed to read entry in note directory {dir_fmt}:\n{err}")
+            }
         };
 
         let entry_path = entry.path();
@@ -945,126 +965,156 @@ fn collect_nya_files_in_dir(
             .extension()
             .is_some_and(|ext| ext.to_str().unwrap() == "nya");
 
-        // eprintln!("[Info] Reading entry `{entry_fmt}`");
+        // eprintln!("[Info] Reading entry {entry_fmt}");
 
-        if is_nya_file {
-            let source = match std::fs::read_to_string(&entry_path) {
-                Ok(s) => s,
-                Err(read_err) => {
-                    skip!("[Warn] skipping `{entry_fmt}`: {read_err}",);
-                }
-            };
-
-            let mut stream = source.chars().peekable();
-            if let Err(parse_err) = collect_chunks_from_stream(&mut stream, 1, chunks_buf, &source)
-            {
-                skip!("[Warn] skipping `{entry_fmt}`: {parse_err}");
-            }
-
-            let Some(chunk) = chunks_buf.first() else {
-                skip!("[Warn] skipping `{entry_fmt}`: file is empty");
-            };
-
-            let idx = match get_index_value_from_chunk(chunk, &source) {
-                Ok(value) => value,
-                Err(err) => {
-                    skip!("[Warn] skipping `{entry_fmt}: {err}`");
-                }
-            };
-
-            if let Some(p) = found_files.insert(idx, entry_path.to_path_buf()) {
-                skip!(
-                    "[Warn] skipping `{entry_fmt}: duplicate index found `{idx}`, previously defineded in `{}`",
-                    p.display()
-                );
-            }
+        if !is_nya_file {
+            continue 'entries_loop;
         } else if entry_path.is_dir() {
-            all_succeeded = collect_nya_files_in_dir(&entry_path, found_files, chunks_buf)?;
+            all_succeeded = collect_nya_files_in_dir(&entry_path, found_files)?;
+            continue 'entries_loop;
+        }
+
+        let source = match std::fs::read_to_string(&entry_path) {
+            Ok(s) => s,
+            Err(read_err) => {
+                go_next!("[Warn] skipping {entry_fmt}: {read_err}");
+            }
+        };
+
+        let mut stream = TwoCharsWindowIter::from(source.as_str());
+
+        let idx_chunk = 'searching_chunk: loop {
+            match collect_next_chunk(&mut stream) {
+                Some(Ok(Chunk {
+                    kind: ChunkKind::Whitespaces,
+                    ..
+                })) => continue 'searching_chunk,
+                Some(Ok(
+                    ch @ Chunk {
+                        kind: ChunkKind::Index,
+                        ..
+                    },
+                )) => break 'searching_chunk ch,
+                Some(Err(e)) => go_next!('entries_loop, "[Warn] skipping {entry_fmt}:\n{e}"),
+                _ => {
+                    go_next!('entries_loop, "[Warn] skipping {entry_fmt}: couldn't find an index chunk")
+                }
+            }
+        };
+
+        let idx = match get_index_value_from_chunk(&idx_chunk, &source) {
+            Ok(value) => value,
+            Err(err) => {
+                go_next!("[Warn] skipping {entry_fmt}:\n{err}");
+            }
+        };
+
+        if let Some(p) = found_files.insert(idx, entry_path.to_path_buf()) {
+            let other_f = p.display();
+            go_next!(
+                "[Warn] skipping {entry_fmt}: duplicate index found {idx}, previously defineded in {other_f}"
+            );
         }
     }
 
     Ok(all_succeeded)
 }
 
-fn collect_chunks_from_file(
-    path: &Path,
-    source_buf: &mut String,
-    chunks: &mut Vec<Chunk>,
-) -> Result<(), String> {
-    File::open(path)
-        .map_err(to_string)?
-        .read_to_string(source_buf)
-        .map_err(to_string)?;
-    let mut stream = source_buf.chars().peekable();
-    collect_chunks_from_stream(&mut stream, usize::MAX, chunks, source_buf).map_err(to_string)?;
+fn read_nya_file(path: &Path) -> Result<(String, Vec<Chunk>), String> {
+    let mut chunks_buf = Vec::<Chunk>::new();
 
-    Ok(())
+    let source_buf = std::fs::read_to_string(path).map_err(to_string)?;
+    let mut stream = TwoCharsWindowIter::from(source_buf.as_str());
+
+    while let Some(res) = collect_next_chunk(&mut stream) {
+        chunks_buf.push(res.map_err(to_string)?);
+    }
+
+    Ok((source_buf, chunks_buf))
 }
 
-fn collect_chunks_from_last_file_in_dir(
-    dir: &Path,
-    source_buf: &mut String,
-    chunks: &mut Vec<Chunk>,
-) -> Result<(), String> {
+fn find_last_nya(dir: &Path) -> Result<Option<PathBuf>, String> {
     let mut found = HashMap::<usize, PathBuf>::new();
-    let all_succeeded = collect_nya_files_in_dir(dir, &mut found, chunks).map_err(to_string)?;
+    let all_succeeded = collect_nya_files_in_dir(dir, &mut found).map_err(to_string)?;
 
     if !all_succeeded {
         return Err(format!(
-            "there was some issues while reading `{}`",
+            "there was some issues while reading {}",
             dir.display()
         ));
     }
 
-    let Some((_, path)) = found
+    let mb_path = found
         .into_iter()
         .max_by(|(k, _), (other_k, _)| k.cmp(other_k))
-    else {
-        eprintln!("[Warn] `{}` doesn't contain any `.nya` file, creating first one", dir.display());
+        .map(|(_, p)| p);
 
-        chunks.clear();
-        chunks.push(Chunk {
-            text: " 1".into(),
-            kind: ChunkKind::Index,
-            position: 1,
-            line: 1,
-        });
-
-        return Ok(());
-    };
-
-    chunks.clear();
-    collect_chunks_from_file(&path, source_buf, chunks).map_err(to_string)
+    Ok(mb_path)
 }
 
-fn main() {
-    let (input, output) = match parse_args(std::env::args().skip(1)) {
-        Ok(res) => res,
+fn create_new_nya(
+    path: &Path,
+    mut source: String,
+    chunks: impl IntoIterator<Item = Chunk>,
+) -> Result<(), String> {
+    let mut f = File::create(path).map_err(to_string)?;
+
+    for chunk in chunks.into_iter() {
+        write!(&mut source, "{chunk}").map_err(to_string)?;
+    }
+
+    write!(&mut f, "{source}",).map_err(to_string)?;
+
+    Ok(())
+}
+
+fn handle_dir_input(dir: PathBuf, output: Output) {
+    match find_last_nya(&dir) {
+        Ok(Some(f)) => return handle_file_input(f, output),
         Err(e) => return eprintln!("[Err] {e}"),
+        _ => (),
+    }
+
+    let dir_fmt = dir.display();
+
+    let Output::File(f) = output else {
+        return eprintln!("[Warn] couldn't find any .nya files in {dir_fmt}");
     };
 
-    let mut source = String::new();
-    let mut chunks = Vec::<Chunk>::new();
+    eprintln!("[Info] creating your first .nya in {dir_fmt}");
+
+    let index_chunk = Chunk {
+        kind: ChunkKind::Index,
+        text: " 1".into(),
+        ..Default::default()
+    };
+
+    if let Err(e) = create_new_nya(&f, String::new(), Some(index_chunk)) {
+        eprintln!("[Err] failed to create {}: {e}", f.display())
+    }
+
+    println!("{}", f.display())
+}
+
+fn handle_file_input(path: PathBuf, output: Output) {
     let mut defines = HashMap::<Label, Script>::new();
     let mut call_stack = Vec::<Cmd>::new();
     let mut err_stack = Vec::<Error>::new();
 
-    let collecting_result = match input {
-        Input::File(f) => collect_chunks_from_file(&f, &mut source, &mut chunks),
-        Input::Dir(d) => collect_chunks_from_last_file_in_dir(&d, &mut source, &mut chunks),
+    let (source, mut chunks) = match read_nya_file(&path) {
+        Ok(s) => s,
+        Err(e) => return eprintln!("[Err] in {}:\n{e}", path.display()),
     };
 
-    if let Err(e) = collecting_result {
-        return eprintln!("[Err] {e}");
-    }
-
-    // println!("pre eval {chunks:#?}");
-
     for chunk in &mut chunks {
-        evaluate_chunk(chunk, &mut defines, &mut call_stack, &mut err_stack, &source)
+        evaluate_chunk(
+            chunk,
+            &mut defines,
+            &mut call_stack,
+            &mut err_stack,
+            &source,
+        )
     }
-
-    // println!("post eval: {chunks:#?}");
 
     if !call_stack.is_empty() {
         let last_chunk = chunks.last().expect("at least one chunk must exist");
@@ -1077,34 +1127,44 @@ fn main() {
         });
     }
 
+    let path_fmt = path.display();
     if !err_stack.is_empty() {
+        eprintln!("[Err] in {path_fmt}");
+
         for err in err_stack {
-            eprintln!("[Err] {err}");
+            eprintln!("{err}");
         }
 
         return;
     }
 
-    source.clear();
-    for chunk in chunks {
-        let _ = write!(&mut source, "{}", chunk);
-    }
-
     let output_path = match output {
-        Output::Stdout => return println!("{source}"),
+        Output::Stdout => {
+            for chunk in chunks {
+                print!("{chunk}");
+            }
+            return;
+        },
         Output::File(p) => p,
     };
 
     let path_fmt = output_path.display();
 
-    let mut output_file = match File::create(&output_path) {
-        Ok(f) => f,
-        Err(e) => return eprintln!("[Err] failed to create `{path_fmt}`: {e}"),
-    };
-
-    if let Err(e) = write!(output_file, "{source}") {
-        return eprintln!("[Err] failed to save output to `{path_fmt}`: {e}");
+    if let Err(e) = create_new_nya(&output_path, source, chunks) {
+        return eprintln!("[Err] failed to create {path_fmt}: {e}");
     }
 
     println!("{path_fmt}");
+}
+
+fn main() {
+    let (input, output) = match parse_args(std::env::args().skip(1)) {
+        Ok(res) => res,
+        Err(e) => return eprintln!("[Err] {e}"),
+    };
+
+    match input {
+        Input::File(f) => handle_file_input(f, output),
+        Input::Dir(d) => handle_dir_input(d, output),
+    }
 }

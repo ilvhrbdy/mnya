@@ -39,7 +39,7 @@ to tell `mnya` to include this chunk into the new note:
 Now, as it's your daily tasks, you need to uncheck them for each new note,
 we can define a shell script that will do that:
 ```
-@ uncheck_boxes: sed "s/\[X\]/\[ \]/"
+@ uncheck_boxes: sed "s/\[X\]/\[ \]/g"
 ```
 Everything after `@` and until a newline or `::` is treated as command to `mnya`.
 So you tell that you want to define a label called `uncheck_boxes` with the provided shell script, after the `:`.
@@ -54,7 +54,7 @@ Now you can run the labeled script on a chunk of text like this:
 ::
 ```
 
-Or you can even even chain scripts:
+Or you can even chain scripts:
 ```
 @ uncheck_boxes
 @ do_other_stuf
