@@ -495,11 +495,7 @@ fn parse_chunk<'src_lt>(
 fn collect_one_line_chunk(chunk: &mut Chunk, stream: &mut TwoCharsWindowIter) {
     while let Some(next_chs) = stream.next() {
         match next_chs {
-            (':', Some(':')) => {
-                stream.back();
-                break;
-            }
-            ('\n', _) => {
+            (':', Some(':')) | ('\n', _) | ('@', _) => {
                 stream.back();
                 break;
             }
