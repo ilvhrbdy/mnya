@@ -152,14 +152,11 @@ impl Display for Error<'_> {
                 opening_line,
                 opening_position,
             } => {
-                let delim_line = opening_line;
-                let delim_position = opening_position - delimiter.len();
-
                 writeln!(
                     f,
-                    "unclosed chunk delimiter {delimiter}\n---> starts at {delim_line}:{delim_position} here:"
+                    "unclosed chunk delimiter {delimiter}\n---> starts at {opening_line}:{opening_position} here:"
                 )?;
-                point_on_err(f, *delim_line, delim_position, self.source)?;
+                point_on_err(f, *opening_line, *opening_position, self.source)?;
 
                 writeln!(
                     f,
@@ -206,33 +203,28 @@ fn parse_args(
     };
 
     let mut mb_input = None::<Input>;
-    let mut mb_output = None::<Output>;
     let mut output_name = String::new();
     let env_dir = std::env::var(ENV_INPUT_DIRECTORY).ok().map(expanded);
 
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "-h" => return Err(USAGE.into()),
-            "-print" => mb_output = Some(Output::Stdout),
             "-i" => match args.next() {
                 Some(file_name) => mb_input = Some(Input::File(PathBuf::from(file_name))),
                 None => return Err("input file for -i flag where?".into()),
             },
             a if a.starts_with("-") => {
-                return Err("i don't know what this flag means..".into());
+                return Err(format!("i don't know what this flag means: {arg}").into());
             }
-            _ if !matches!(mb_output, Some(Output::Stdout)) => {
+            _ => {
                 output_name.push_str(&arg);
                 output_name.push('_');
             }
-            _ => (),
         }
     }
 
-    let output = if let Some(out @ Output::Stdout) = mb_output {
-        out
-    } else if output_name.trim().is_empty() {
-        return Err("throw some words for enw note file name".into());
+    let output = if output_name.trim().is_empty() {
+        Output::Stdout
     } else {
         let _ = output_name.pop(); // remove trailing '_'
 
@@ -305,30 +297,25 @@ fn run_bash_script(
 #[derive(Debug)]
 struct TwoCharsWindowIter<'src_lt> {
     source: &'src_lt str,
-    source_bytes: &'src_lt [u8],
-    idx: usize,
+    next_idx: usize,
     cursor_line: usize,
     cursor_position: usize,
 }
 
 impl TwoCharsWindowIter<'_> {
     fn back(&mut self) {
-        let new_idx = self.idx.saturating_sub(1);
-
-        if self.idx == new_idx {
+        let Some(new_idx) = self.next_idx.checked_sub(1) else {
             return;
-        }
+        };
 
-        self.idx = new_idx;
-        let prev_ch = self.source_bytes[new_idx] as char;
+        self.next_idx = new_idx;
 
-        if prev_ch != '\n' {
+        if self.cursor_position == 1 && self.cursor_line > 1 {
+            self.cursor_line -= 1;
+            self.cursor_position = self.source.lines().nth(self.cursor_line).unwrap().len() + 1;
+        } else if self.cursor_position > 1 {
             self.cursor_position -= 1;
-            return;
         }
-
-        self.cursor_line -= 1;
-        self.cursor_position = self.source.lines().nth(self.cursor_line).unwrap().len();
     }
 }
 
@@ -336,15 +323,11 @@ impl Iterator for TwoCharsWindowIter<'_> {
     type Item = (char, Option<char>);
 
     fn next(&mut self) -> Option<Self::Item> {
-        let i = self.idx;
-        let t = self.source_bytes;
+        let i = self.next_idx;
+        let bs = self.source.as_bytes();
 
-        if let Some(prev_ch) = i
-            .checked_sub(1)
-            .and_then(|pi| t.get(pi))
-            .map(|b| *b as char)
-        {
-            if prev_ch == '\n' {
+        if let Some(prev) = self.next_idx.checked_sub(1).and_then(|pi| bs.get(pi)) {
+            if *prev as char == '\n' {
                 self.cursor_line += 1;
                 self.cursor_position = 1;
             } else {
@@ -352,10 +335,10 @@ impl Iterator for TwoCharsWindowIter<'_> {
             }
         }
 
-        let first = t.get(i).map(|b| *b as char)?;
-        let mb_second = t.get(i + 1).map(|b| *b as char);
+        let first = bs.get(i).map(|b| *b as char)?;
+        let mb_second = bs.get(i + 1).map(|b| *b as char);
 
-        self.idx += 1;
+        self.next_idx += 1;
 
         Some((first, mb_second))
     }
@@ -365,8 +348,7 @@ impl<'sl> From<&'sl str> for TwoCharsWindowIter<'sl> {
     fn from(source: &'sl str) -> Self {
         Self {
             source,
-            source_bytes: source.as_bytes(),
-            idx: 0,
+            next_idx: 0,
             cursor_line: 1,
             cursor_position: 1,
         }
@@ -452,39 +434,16 @@ impl Display for Chunk {
 fn parse_chunk<'src_lt>(
     stream: &mut TwoCharsWindowIter<'src_lt>,
 ) -> Option<Result<Chunk, Error<'src_lt>>> {
-    let mut chunk = Chunk::default();
+    let next_chs = stream.next()?;
 
-    let is_useless =
-        |chunk: &Chunk| matches!(chunk.kind, ChunkKind::Whitespaces) && chunk.text.is_empty();
+    let mut chunk = Chunk {
+        line: stream.cursor_line,
+        position: stream.cursor_position,
+        ..Default::default()
+    };
 
-    macro_rules! start_chunk {
-        ($kind:expr) => {{
-            chunk.kind = $kind;
-            let (opening, _) = chunk.kind.delimiters();
-            let delim_len = opening.len();
-            chunk.position = delim_len + stream.cursor_position;
-            chunk.line = stream.cursor_line;
-
-            // first char of delim is eaten at this point
-            for _ in 0..delim_len.saturating_sub(1) {
-                let _ = stream.next();
-            }
-        }};
-    }
-
-    macro_rules! close_and_return_chunk {
+    macro_rules! return_unclosed_delim_err {
         () => {{
-            let (_, closing) = chunk.kind.delimiters();
-            // first char of delim is eaten at this point
-            for _ in 0..closing.len().saturating_sub(1) {
-                let _ = stream.next();
-            }
-            return Some(Ok(chunk));
-        }};
-    }
-
-    macro_rules! return_err_unclosed {
-        () => {
             let (opening, closing) = chunk.kind.delimiters();
             return Some(Err(Error {
                 source: stream.source,
@@ -496,104 +455,132 @@ fn parse_chunk<'src_lt>(
                     opening_position: chunk.position - opening.len(),
                 },
             }));
-        };
+        }};
     }
+
+    match next_chs {
+        ('@', Some('#')) => {
+            let _ = stream.next();
+            chunk.position = stream.cursor_position + 1;
+            chunk.kind = ChunkKind::Index;
+            collect_one_line_chunk(&mut chunk, stream)
+        }
+        (':', Some(':')) => {
+            let _ = stream.next();
+            chunk.position = stream.cursor_position + 1;
+            if collect_text_block_chunk(&mut chunk, stream).is_err() {
+                return_unclosed_delim_err!();
+            }
+        }
+        ('@', Some('@')) => {
+            let _ = stream.next();
+            chunk.position = stream.cursor_position + 1;
+            if collect_cmd_block_chunk(&mut chunk, stream).is_err() {
+                return_unclosed_delim_err!();
+            }
+        }
+        ('@', _) => {
+            chunk.position += 1;
+            chunk.kind = ChunkKind::OneLineCmd;
+            collect_one_line_chunk(&mut chunk, stream)
+        }
+        (ch @ '\n', _) => {
+            chunk.text.push(ch);
+            collect_whitespaces_chunk(&mut chunk, stream)
+        }
+        _ => collect_discarded_chunk(&mut chunk, stream),
+    };
+
+    Some(Ok(chunk))
+}
+
+// logic is the same for OneLineCmd and Index chunks
+fn collect_one_line_chunk(chunk: &mut Chunk, stream: &mut TwoCharsWindowIter) {
     while let Some(next_chs) = stream.next() {
-        println!(
-            "{}:{} {} {next_chs:?}",
-            stream.cursor_line, stream.cursor_position, stream.idx
-        );
-        // TODO: maybe a way to escape '::' '@' '@@' ?
-        match chunk.kind {
-            // Index = '@# ..'
-            // Cmd = '@ ...'
-            // collect until  '\n' or '::' or 'EOF'
-            ChunkKind::Index | ChunkKind::OneLineCmd => match next_chs {
-                (':', Some(':')) => {
-                    stream.back();
-                    return Some(Ok(chunk));
-                }
-                ('\n', _) => {
-                    stream.back();
-                    return Some(Ok(chunk));
-                }
-                (ch, mb_next) => {
-                    chunk.text.push(ch);
-                    if mb_next.is_none() {
-                        return Some(Ok(chunk));
-                    }
-                }
-            },
-            // Text = ':: .. ::'
-            // collect until '::'
-            ChunkKind::TextBlock => match next_chs {
-                (':', Some(':')) => close_and_return_chunk!(),
-                (ch, next_ch) => {
-                    chunk.text.push(ch);
-                    if next_ch.is_none() {
-                        return_err_unclosed!();
-                    }
-                }
-            },
-            // CmdBlock = '@@ .. @@'
-            // collect until '@@'
-            ChunkKind::CmdBlock {
-                ref mut closed_by_self,
-            } => match next_chs {
-                (':', Some(':')) => {
-                    *closed_by_self = false;
-                    stream.back();
-                    return Some(Ok(chunk));
-                }
-                ('@', Some('@')) => {
-                    *closed_by_self = true;
-                    close_and_return_chunk!();
-                }
-                (ch, next_ch) => {
-                    chunk.text.push(ch);
-                    if next_ch.is_none() {
-                        return_err_unclosed!();
-                    }
-                }
-            },
-            ChunkKind::DiscardedText | ChunkKind::Whitespaces => {
-                let current_is_useless = is_useless(&chunk);
-                macro_rules! start_if_useless {
-                    ($kind:expr) => {{
-                        if current_is_useless {
-                            start_chunk!($kind);
-                        } else {
-                            stream.back();
-                            return Some(Ok(chunk));
-                        }
-                    }};
+        match next_chs {
+            (':', Some(':')) => {
+                stream.back();
+                break;
+            }
+            ('\n', _) => {
+                stream.back();
+                break;
+            }
+            (ch, _) => chunk.text.push(ch),
+        }
+    }
+}
+
+fn collect_text_block_chunk(chunk: &mut Chunk, stream: &mut TwoCharsWindowIter) -> Result<(), ()> {
+    chunk.kind = ChunkKind::TextBlock;
+    while let Some(next_chs) = stream.next() {
+        match next_chs {
+            (':', Some(':')) => {
+                let _ = stream.next();
+                return Ok(());
+            }
+            (ch, next_ch) => {
+                if next_ch.is_none() {
+                    break;
                 }
 
-                match next_chs {
-                    ('@', Some('#')) => start_if_useless!(ChunkKind::Index),
-                    (':', Some(':')) => start_if_useless!(ChunkKind::TextBlock),
-                    ('@', Some('@')) => start_if_useless!(ChunkKind::CmdBlock {
-                        closed_by_self: false
-                    }),
-                    ('@', _) => start_if_useless!(ChunkKind::OneLineCmd),
-                    (ch, _) if chunk.kind == ChunkKind::Whitespaces => {
-                        if ch.is_whitespace() {
-                            chunk.text.push(ch);
-                        } else {
-                            start_if_useless!(ChunkKind::DiscardedText);
-                        }
-                    }
-                    _ => (),
-                }
+                chunk.text.push(ch);
             }
         }
     }
 
-    if is_useless(&chunk) {
-        return None;
+    Err(())
+}
+
+fn collect_cmd_block_chunk(chunk: &mut Chunk, stream: &mut TwoCharsWindowIter) -> Result<(), ()> {
+    while let Some(next_chs) = stream.next() {
+        match next_chs {
+            (':', Some(':')) => {
+                stream.back();
+                chunk.kind = ChunkKind::CmdBlock {
+                    closed_by_self: false,
+                };
+                return Ok(());
+            }
+            ('@', Some('@')) => {
+                let _ = stream.next();
+                chunk.kind = ChunkKind::CmdBlock {
+                    closed_by_self: true,
+                };
+                return Ok(());
+            }
+            (ch, next_ch) => {
+                if next_ch.is_none() {
+                    break;
+                }
+
+                chunk.text.push(ch);
+            }
+        }
     }
 
-    Some(Ok(chunk))
+    Err(())
+}
+
+fn collect_whitespaces_chunk(chunk: &mut Chunk, stream: &mut TwoCharsWindowIter) {
+    chunk.kind = ChunkKind::Whitespaces;
+    while let Some((ch, _)) = stream.next() {
+        if ch.is_whitespace() {
+            chunk.text.push(ch);
+        } else {
+            stream.back();
+            break;
+        }
+    }
+}
+
+fn collect_discarded_chunk(chunk: &mut Chunk, stream: &mut TwoCharsWindowIter) {
+    chunk.kind = ChunkKind::DiscardedText;
+    for next_chs in stream {
+        if let (':', Some(':')) | ('@', _) = next_chs {
+            break;
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -729,12 +716,12 @@ pub fn parse_cmd_from_chunk<'src_lt>(
 fn execute_cmd_define<'src_lt>(
     label: Label,
     script: Script,
-    defines: &mut HashMap<Label, Script>,
+    defs: &mut HashMap<Label, Script>,
     err_stack: &mut Vec<Error<'src_lt>>,
     source: &'src_lt str,
 ) {
-    let Some((existing_label, _)) = defines.remove_entry(&label) else {
-        let _ = defines.insert(label, script);
+    let Some((existing_label, _)) = defs.remove_entry(&label) else {
+        let _ = defs.insert(label, script);
         return;
     };
 
@@ -769,7 +756,7 @@ fn execute_cmd_anon_eval<'src_lt>(
 fn execute_cmd_eval<'src_lt>(
     labels: Vec<Label>,
     input: &mut String,
-    defines: &HashMap<Label, Script>,
+    defs: &HashMap<Label, Script>,
     err_stack: &mut Vec<Error<'src_lt>>,
     source: &'src_lt str,
 ) {
@@ -778,7 +765,7 @@ fn execute_cmd_eval<'src_lt>(
     let mut abort = false;
 
     for l in labels {
-        let Some((label, script)) = defines.get_key_value(&l) else {
+        let Some((label, script)) = defs.get_key_value(&l) else {
             abort = true;
             let Label {
                 name,
@@ -826,16 +813,14 @@ fn execute_cmd_eval<'src_lt>(
 fn execute_cmd<'src_lt>(
     cmd: Cmd,
     input: &mut String,
-    defines: &mut HashMap<Label, Script>,
+    defs: &mut HashMap<Label, Script>,
     err_stack: &mut Vec<Error<'src_lt>>,
     source: &'src_lt str,
 ) {
     match cmd {
         Cmd::AnonEval(script) => execute_cmd_anon_eval(&script, input, err_stack, source),
-        Cmd::Eval(labels) => execute_cmd_eval(labels, input, defines, err_stack, source),
-        Cmd::Define { label, script } => {
-            execute_cmd_define(label, script, defines, err_stack, source)
-        }
+        Cmd::Eval(labels) => execute_cmd_eval(labels, input, defs, err_stack, source),
+        Cmd::Define { .. } => unreachable!(),
     }
 }
 
@@ -862,7 +847,7 @@ fn update_index_chunk<'src_lt>(
 
 fn evaluate_chunk<'src_lt>(
     chunk: &mut Chunk,
-    defines: &mut HashMap<Label, Script>,
+    defs: &mut HashMap<Label, Script>,
     call_stack: &mut Vec<Cmd>,
     err_stack: &mut Vec<Error<'src_lt>>,
     source: &'src_lt str,
@@ -870,6 +855,9 @@ fn evaluate_chunk<'src_lt>(
     match chunk.kind {
         ChunkKind::OneLineCmd | ChunkKind::CmdBlock { .. } => {
             match parse_cmd_from_chunk(source, chunk) {
+                Ok(Cmd::Define { label, script }) => {
+                    execute_cmd_define(label, script, defs, err_stack, source)
+                }
                 Ok(cmd) => call_stack.push(cmd),
                 Err(e) => err_stack.push(e),
             }
@@ -894,7 +882,7 @@ fn evaluate_chunk<'src_lt>(
         }
         ChunkKind::TextBlock => {
             for cmd in call_stack.drain(..) {
-                execute_cmd(cmd, &mut chunk.text, defines, err_stack, source);
+                execute_cmd(cmd, &mut chunk.text, defs, err_stack, source);
             }
         }
         ChunkKind::Whitespaces => (),
@@ -1105,7 +1093,7 @@ fn handle_dir_input(dir: PathBuf, output: Output) {
 }
 
 fn handle_file_input(path: PathBuf, output: Output) {
-    let mut defines = HashMap::<Label, Script>::new();
+    let mut defs = HashMap::<Label, Script>::new();
     let mut call_stack = Vec::<Cmd>::new();
     let mut err_stack = Vec::<Error>::new();
 
@@ -1115,13 +1103,7 @@ fn handle_file_input(path: PathBuf, output: Output) {
     };
 
     for chunk in &mut chunks {
-        evaluate_chunk(
-            chunk,
-            &mut defines,
-            &mut call_stack,
-            &mut err_stack,
-            &source,
-        )
+        evaluate_chunk(chunk, &mut defs, &mut call_stack, &mut err_stack, &source)
     }
 
     if !call_stack.is_empty() {
