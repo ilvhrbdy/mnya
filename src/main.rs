@@ -488,7 +488,7 @@ fn parse_chunk<'src_lt>(
             chunk.text.push(ch);
             collect_whitespaces_chunk(&mut chunk, stream)
         }
-        _ => collect_discarded_chunk(&mut chunk, stream),
+        _ => collect_discarded_text_chunk(&mut chunk, stream),
     };
 
     Some(Ok(chunk))
@@ -574,10 +574,12 @@ fn collect_whitespaces_chunk(chunk: &mut Chunk, stream: &mut TwoCharsWindowIter)
     }
 }
 
-fn collect_discarded_chunk(chunk: &mut Chunk, stream: &mut TwoCharsWindowIter) {
+fn collect_discarded_text_chunk(chunk: &mut Chunk, stream: &mut TwoCharsWindowIter) {
     chunk.kind = ChunkKind::DiscardedText;
-    for next_chs in stream {
-        if let (':', Some(':')) | ('@', _) = next_chs {
+    // println!("{next_chs:?} = {}:{}", stream.cursor_line, stream.cursor_position);
+    while let Some(chs) = stream.next() {
+        if let (':', Some(':')) | ('@', _) = chs {
+            stream.back();
             break;
         }
     }
@@ -1023,6 +1025,7 @@ fn read_nya_file(path: &Path) -> Result<(String, Vec<Chunk>), String> {
     let mut stream = TwoCharsWindowIter::from(source_buf.as_str());
 
     while let Some(res) = parse_chunk(&mut stream) {
+        // println!("DBG: pushing chunk {chunk:?}");
         chunks_buf.push(res.map_err(to_string)?);
     }
 
