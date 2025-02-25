@@ -8,8 +8,6 @@ use std::{
     process::{Command, Stdio},
 };
 
-// TODO: when we are returning a last file,
-//      return chunk containing index and stream to continure parsing instead of reparsing file again
 const ENV_INPUT_DIRECTORY: &str = "NYA_DIRECTORY";
 
 const USAGE: &str = "Usage:
@@ -17,15 +15,14 @@ const USAGE: &str = "Usage:
 
 Flags:
     -h                  - print this message
-    -print              - write to STDOUT instead of a file
     -i <INPUT FILE>     - evaluate input file instead of reading NYA_DIRECTORY;
-                          PWD will be used to create output file,
-                          if neither NYA_DIRECTORY nor -print is provided
+                          PWD will be used to create output file, if NYA_DIRECTORY is not set
 
 Env:
-    NYA_DIRECTORY      - default nya folder; act as working directory
+    NYA_DIRECTORY       - default nya folder; act as working directory
 
-<OUTPUT FILE NAME> could be built from multiple arguments that do not start with -
+<OUTPUT FILE NAME> could be built from multiple arguments that do not start with '-'.
+If no arguments for <OUTPUT FILE NAME> was provided, evaluated string will be printed to STDOUT.
 After successful evaluation, the path to the output file will be printed to STDOUT.
 All of the [Err] and [Warn] will be printed to STDERR.";
 
