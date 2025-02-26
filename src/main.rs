@@ -3,7 +3,7 @@ use std::{
     fmt::{self, Display, Formatter, Write as FmtWrite},
     fs::File,
     hash,
-    io::{Read, Write as IoWrite},
+    io::{BufWriter, Read, Write as IoWrite},
     path::{Path, PathBuf},
     process::{Command, Stdio},
 };
@@ -15,6 +15,7 @@ const USAGE: &str = "Usage:
 
 Flags:
     -h                  - print this message
+    -print              - write output to STDOUT instead of new file
     -i <INPUT FILE>     - evaluate input file instead of reading NYA_DIRECTORY;
                           PWD will be used to create output file, if NYA_DIRECTORY is not set
 
@@ -22,7 +23,7 @@ Env:
     NYA_DIRECTORY       - default nya folder; act as working directory
 
 <OUTPUT FILE NAME> could be built from multiple arguments that do not start with '-'.
-If no arguments for <OUTPUT FILE NAME> was provided, evaluated string will be printed to STDOUT.
+If no arguments for <OUTPUT FILE NAME> was provided, path to last file will be printed.
 After successful evaluation, the path to the output file will be printed to STDOUT.
 All of the [Err] and [Warn] will be printed to STDERR.";
 
@@ -180,8 +181,9 @@ enum Input {
 
 #[derive(Debug)]
 enum Output {
-    Stdout,
-    File(PathBuf),
+    PrintLastFilePath,
+    WriteToStdout,
+    WriteToFile(PathBuf),
 }
 
 fn parse_args(
@@ -200,12 +202,14 @@ fn parse_args(
     };
 
     let mut mb_input = None::<Input>;
+    let mut mb_output = None::<Output>;
     let mut output_name = String::new();
     let env_dir = std::env::var(ENV_INPUT_DIRECTORY).ok().map(expanded);
 
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "-h" => return Err(USAGE.into()),
+            "-print" => mb_output = Some(Output::WriteToStdout),
             "-i" => match args.next() {
                 Some(file_name) => mb_input = Some(Input::File(PathBuf::from(file_name))),
                 None => return Err("input file for -i flag where?".into()),
@@ -220,8 +224,10 @@ fn parse_args(
         }
     }
 
-    let output = if output_name.trim().is_empty() {
-        Output::Stdout
+    let output = if let Some(o @ Output::WriteToStdout) = mb_output {
+        o
+    } else if output_name.trim().is_empty() {
+       Output::PrintLastFilePath
     } else {
         let _ = output_name.pop(); // remove trailing '_'
 
@@ -234,7 +240,7 @@ fn parse_args(
         output_name.push_str(".nya");
         path.push(output_name);
 
-        Output::File(path)
+        Output::WriteToFile(path)
     };
 
     let input = mb_input
@@ -245,7 +251,7 @@ fn parse_args(
 
     // throw error before evaluation
     // input path will be checked later with read_to_string
-    if let Output::File(f) = &output {
+    if let Output::WriteToFile(f) = &output {
         if f.exists() {
             return Err(format!("{} already exists", f.display()).into());
         }
@@ -481,7 +487,7 @@ fn parse_chunk<'src_lt>(
             chunk.kind = ChunkKind::OneLineCmd;
             collect_one_line_chunk(&mut chunk, stream)
         }
-        (ch @ '\n', _) => {
+        (ch, _) if ch.is_whitespace() => {
             chunk.text.push(ch);
             collect_whitespaces_chunk(&mut chunk, stream)
         }
@@ -577,6 +583,11 @@ fn collect_discarded_text_chunk(chunk: &mut Chunk, stream: &mut TwoCharsWindowIt
         }
     }
 }
+
+// TODO: there is no reason to allocate memory for:
+//      1. label names
+//      2. scripts
+//      3. command chunks
 
 #[derive(Debug, Clone, Default)]
 pub struct Label {
@@ -873,6 +884,7 @@ fn evaluate_chunk<'src_lt>(
                     line: chunk.line,
                     position: chunk.position,
                 });
+                call_stack.clear();
             }
         }
         ChunkKind::TextBlock => {
@@ -1069,7 +1081,7 @@ fn handle_dir_input(dir: PathBuf, output: Output) {
 
     let dir_fmt = dir.display();
 
-    let Output::File(f) = output else {
+    let Output::WriteToFile(f) = output else {
         return eprintln!("[Warn] couldn't find any .nya files in {dir_fmt}");
     };
 
@@ -1092,47 +1104,49 @@ fn handle_file_input(path: PathBuf, output: Output) {
     let mut defs = HashMap::<Label, Script>::new();
     let mut call_stack = Vec::<Cmd>::new();
     let mut err_stack = Vec::<Error>::new();
+    let path_fmt = path.display();
+
+    if let Output::PrintLastFilePath = output {
+        return println!("{path_fmt}");
+    }
 
     let (mut source, mut chunks) = match read_nya_file(&path) {
         Ok(s) => s,
         Err(e) => return eprintln!("[Err] in {}:\n{e}", path.display()),
     };
 
+    // println!("-- evaluating {chunks:#?}");
+
     for chunk in &mut chunks {
         evaluate_chunk(chunk, &mut defs, &mut call_stack, &mut err_stack, &source)
     }
 
-    if !call_stack.is_empty() {
-        let last_chunk = chunks.last().expect("at least one chunk must exist");
+    let output_path = match output {
+        Output::WriteToFile(p) => p,
+        Output::WriteToStdout => {
+            let mut stdout = BufWriter::new(std::io::stdout());
+            for chunk in chunks {
+                write!(&mut stdout, "{chunk}").unwrap();
+            }
+            stdout.flush().unwrap();
 
-        err_stack.push(Error {
-            source: &source,
-            kind: ErrorKind::MissingInputTextBlock,
-            line: last_chunk.line,
-            position: last_chunk.position,
-        });
-    }
+            return;
+        }
+        Output::PrintLastFilePath => unreachable!(),
+    };
 
-    let path_fmt = path.display();
     if !err_stack.is_empty() {
-        eprintln!("[Err] in {path_fmt}");
+        let mut stderr = BufWriter::new(std::io::stderr());
+        writeln!(&mut stderr, "[Err] in {path_fmt}").unwrap();
 
         for err in err_stack {
-            eprintln!("{err}");
+            writeln!(&mut stderr, "{err}").unwrap();
         }
+
+        stderr.flush().unwrap();
 
         return;
     }
-
-    let output_path = match output {
-        Output::Stdout => {
-            for chunk in chunks {
-                print!("{chunk}");
-            }
-            return;
-        }
-        Output::File(p) => p,
-    };
 
     let path_fmt = output_path.display();
 
