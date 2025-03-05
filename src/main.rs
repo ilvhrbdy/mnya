@@ -50,8 +50,8 @@ enum ErrorKind {
     NonIntegerIndexValue,
     UnclosedDelimiter {
         delimiter: &'static str,
-        opening_line: usize,
-        opening_position: usize,
+        opening_line: u32,
+        opening_position: u32,
     },
     UnallowedLabelCharacter(char),
     UndefinedLabel(String),
@@ -64,28 +64,28 @@ enum ErrorKind {
 pub struct Error<'src_lt> {
     source: &'src_lt str,
     kind: ErrorKind,
-    line: usize,
-    position: usize,
+    line: u32,
+    position: u32,
 }
 
 impl Display for Error<'_> {
     fn fmt(&self, f: &mut Formatter) -> fmt::Result {
         fn point_on_err(
             f: &mut Formatter,
-            err_line: usize,
-            err_position: usize,
+            err_line: u32,
+            err_position: u32,
             text: &str,
         ) -> fmt::Result {
             let display_lines_range = err_line.saturating_sub(4)..err_line;
-            let err_cursor_pad = err_position.saturating_sub(1);
+            let err_cursor_pad = err_position.saturating_sub(1) as usize;
             let err_cursor_pad_char = if err_cursor_pad == 0 { "" } else { " " };
 
             let couple_of_lines = text
                 .lines()
-                .enumerate()
-                .filter(|(n, _)| display_lines_range.contains(n));
+                .zip(0u32..)
+                .filter(|(_, n)| display_lines_range.contains(n));
 
-            for (n, line) in couple_of_lines {
+            for (line, n) in couple_of_lines {
                 let line_num = n + 1;
                 writeln!(
                     f,
@@ -173,13 +173,11 @@ impl Display for Error<'_> {
 
 impl std::error::Error for Error<'_> {}
 
-#[derive(Debug)]
 enum Input {
     Dir(PathBuf),
     File(PathBuf),
 }
 
-#[derive(Debug)]
 enum Output {
     PrintLastFilePath,
     WriteToStdout,
@@ -227,7 +225,7 @@ fn parse_args(
     let output = if let Some(o @ Output::WriteToStdout) = mb_output {
         o
     } else if output_name.trim().is_empty() {
-       Output::PrintLastFilePath
+        Output::PrintLastFilePath
     } else {
         let _ = output_name.pop(); // remove trailing '_'
 
@@ -266,7 +264,7 @@ fn run_bash_script(
     script_args: &[&str],
     input_text: &mut String,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    // println!("runing script: {script_label}\n{s}\n{script_args:?}", s = script.text);
+    // eprintln!("runing script: {script_label}\n{s}\n{script_args:?}", s = script.text);
 
     let mut child = Command::new("bash")
         .arg("-c")
@@ -301,8 +299,8 @@ fn run_bash_script(
 struct TwoCharsWindowIter<'src_lt> {
     source: &'src_lt str,
     next_idx: usize,
-    cursor_line: usize,
-    cursor_position: usize,
+    cursor_line: u32,
+    cursor_position: u32,
 }
 
 impl TwoCharsWindowIter<'_> {
@@ -315,7 +313,12 @@ impl TwoCharsWindowIter<'_> {
 
         if self.cursor_position == 1 && self.cursor_line > 1 {
             self.cursor_line -= 1;
-            self.cursor_position = self.source.lines().nth(self.cursor_line).unwrap().len() + 1;
+            self.cursor_position = 1 + self
+                .source
+                .lines()
+                .nth(self.cursor_line as _)
+                .unwrap()
+                .len() as u32;
         } else if self.cursor_position > 1 {
             self.cursor_position -= 1;
         }
@@ -407,11 +410,11 @@ impl ChunkKind {
 
 #[derive(Debug, Clone)]
 pub struct Chunk {
-    pub kind: ChunkKind,
     pub text: String,
     // start of the chunk, excluding delimiter
-    pub line: usize,
-    pub position: usize,
+    pub line: u32,
+    pub position: u32,
+    pub kind: ChunkKind,
 }
 
 impl Default for Chunk {
@@ -419,8 +422,8 @@ impl Default for Chunk {
         Self {
             line: 1,
             position: 1,
-            kind: ChunkKind::Whitespaces,
             text: String::default(),
+            kind: ChunkKind::Whitespaces,
         }
     }
 }
@@ -455,7 +458,7 @@ fn parse_chunk<'src_lt>(
                 kind: ErrorKind::UnclosedDelimiter {
                     delimiter: closing,
                     opening_line: chunk.line,
-                    opening_position: chunk.position - opening.len(),
+                    opening_position: chunk.position - opening.len() as u32,
                 },
             }));
         }};
@@ -575,7 +578,7 @@ fn collect_whitespaces_chunk(chunk: &mut Chunk, stream: &mut TwoCharsWindowIter)
 
 fn collect_discarded_text_chunk(chunk: &mut Chunk, stream: &mut TwoCharsWindowIter) {
     chunk.kind = ChunkKind::DiscardedText;
-    // println!("{next_chs:?} = {}:{}", stream.cursor_line, stream.cursor_position);
+    // eprintln!(-- "{next_chs:?} = {}:{}", stream.cursor_line, stream.cursor_position);
     while let Some(chs) = stream.next() {
         if let (':', Some(':')) | ('@', _) = chs {
             stream.back();
@@ -592,8 +595,8 @@ fn collect_discarded_text_chunk(chunk: &mut Chunk, stream: &mut TwoCharsWindowIt
 #[derive(Debug, Clone, Default)]
 pub struct Label {
     pub name: String,
-    pub line: usize,
-    pub position: usize,
+    pub line: u32,
+    pub position: u32,
 }
 
 impl hash::Hash for Label {
@@ -616,8 +619,8 @@ impl std::cmp::Eq for Label {}
 #[derive(Debug)]
 pub struct Script {
     pub text: String,
-    pub line: usize,
-    pub position: usize,
+    pub line: u32,
+    pub position: u32,
 }
 
 #[derive(Debug)]
@@ -779,6 +782,8 @@ fn execute_cmd_eval<'src_lt>(
                 position,
             } = l;
 
+            // eprintln!("-- didn't found script for lable '{name}'");
+
             err_stack.push(Error {
                 source,
                 kind: ErrorKind::UndefinedLabel(name),
@@ -788,6 +793,8 @@ fn execute_cmd_eval<'src_lt>(
 
             continue;
         };
+
+        // eprintln!("-- found script '{script:?}' for lable '{label:?}'");
 
         if main_script.is_none() {
             main_script = Some((label, script));
@@ -799,6 +806,7 @@ fn execute_cmd_eval<'src_lt>(
     if abort {
         return;
     }
+
 
     let Some((label, script)) = main_script else {
         return;
@@ -889,6 +897,7 @@ fn evaluate_chunk<'src_lt>(
         }
         ChunkKind::TextBlock => {
             for cmd in call_stack.drain(..) {
+                // eprintln!("-- executing {cmd:?}");
                 execute_cmd(cmd, &mut chunk.text, defs, err_stack, source);
             }
         }
@@ -899,7 +908,7 @@ fn evaluate_chunk<'src_lt>(
 fn get_index_value_from_chunk<'src_lt>(
     chunk: &Chunk,
     source: &'src_lt str,
-) -> Result<usize, Error<'src_lt>> {
+) -> Result<u32, Error<'src_lt>> {
     if !matches!(chunk.kind, ChunkKind::Index) {
         return Err(Error {
             kind: ErrorKind::NoIndexChunk,
@@ -912,7 +921,7 @@ fn get_index_value_from_chunk<'src_lt>(
     let text = &chunk.text;
     let trimmed = text.trim();
 
-    let err_at = |line: usize, position: usize| Error {
+    let err_at = |line: u32, position: u32| Error {
         source,
         kind: ErrorKind::NonIntegerIndexValue,
         line,
@@ -927,16 +936,16 @@ fn get_index_value_from_chunk<'src_lt>(
         + chunk
             .text
             .find(|ch: char| !ch.is_whitespace())
-            .ok_or_else(|| err_at(chunk.line, chunk.position))?;
+            .ok_or_else(|| err_at(chunk.line, chunk.position))? as u32;
 
     trimmed
-        .parse::<usize>()
+        .parse::<u32>()
         .map_err(|_| err_at(chunk.line, text_position))
 }
 
 fn collect_nya_files_in_dir(
     dir: &Path,
-    found_files: &mut HashMap<usize, PathBuf>,
+    found_files: &mut HashMap<u32, PathBuf>,
 ) -> Result<bool, String> {
     let mut all_succeeded = true;
     let dir_fmt = dir.display();
@@ -1030,7 +1039,7 @@ fn read_nya_file(path: &Path) -> Result<(String, Vec<Chunk>), String> {
     let mut stream = TwoCharsWindowIter::from(source_buf.as_str());
 
     while let Some(res) = parse_chunk(&mut stream) {
-        // println!("DBG: pushing chunk {chunk:?}");
+        // eprintln!("DBG: pushing chunk {chunk:?}");
         chunks_buf.push(res.map_err(to_string)?);
     }
 
@@ -1038,7 +1047,7 @@ fn read_nya_file(path: &Path) -> Result<(String, Vec<Chunk>), String> {
 }
 
 fn find_last_nya(dir: &Path) -> Result<Option<PathBuf>, String> {
-    let mut found = HashMap::<usize, PathBuf>::new();
+    let mut found = HashMap::<u32, PathBuf>::new();
     let all_succeeded = collect_nya_files_in_dir(dir, &mut found).map_err(to_string)?;
 
     if !all_succeeded {
@@ -1093,11 +1102,12 @@ fn handle_dir_input(dir: PathBuf, output: Output) {
         ..Default::default()
     };
 
+    let f_fmt = f.display();
     if let Err(e) = create_new_nya(&f, String::new(), Some(index_chunk)) {
-        eprintln!("[Err] failed to create {}: {e}", f.display())
+        eprintln!("[Err] failed to create {f_fmt}: {e}")
     }
 
-    println!("{}", f.display())
+    println!("{f_fmt}")
 }
 
 fn handle_file_input(path: PathBuf, output: Output) {
@@ -1115,10 +1125,23 @@ fn handle_file_input(path: PathBuf, output: Output) {
         Err(e) => return eprintln!("[Err] in {}:\n{e}", path.display()),
     };
 
-    // println!("-- evaluating {chunks:#?}");
+    // eprintln!("-- evaluating {chunks:#?}");
 
     for chunk in &mut chunks {
         evaluate_chunk(chunk, &mut defs, &mut call_stack, &mut err_stack, &source)
+    }
+
+    if !err_stack.is_empty() {
+        let mut stderr = BufWriter::new(std::io::stderr());
+        writeln!(&mut stderr, "[Err] in {path_fmt}").unwrap();
+
+        for err in err_stack {
+            writeln!(&mut stderr, "{err}").unwrap();
+        }
+
+        stderr.flush().unwrap();
+
+        return;
     }
 
     let output_path = match output {
@@ -1134,19 +1157,6 @@ fn handle_file_input(path: PathBuf, output: Output) {
         }
         Output::PrintLastFilePath => unreachable!(),
     };
-
-    if !err_stack.is_empty() {
-        let mut stderr = BufWriter::new(std::io::stderr());
-        writeln!(&mut stderr, "[Err] in {path_fmt}").unwrap();
-
-        for err in err_stack {
-            writeln!(&mut stderr, "{err}").unwrap();
-        }
-
-        stderr.flush().unwrap();
-
-        return;
-    }
 
     let path_fmt = output_path.display();
 
